@@ -224,11 +224,11 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
             actual_filled = stock_in + total_d_day
             if actual_filled > 0:
                 if actual_filled <= 50:
-                    diff = random.randint(-5, 5)
+                    diff = random.randint(-1, 2)
                 elif actual_filled <= 200:
-                    diff = random.randint(-15, 15)
+                    diff = random.randint(-5, 7)
                 else:
-                    diff = random.randint(-30, 30)
+                    diff = random.randint(-6, 10)
                 expected = max(0, actual_filled + diff)  # don't go negative
                 ws.cell(row_num, 6).value = expected
         
