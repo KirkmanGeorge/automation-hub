@@ -54,7 +54,7 @@ st.markdown("""
     
     /* Sidebar */
     section[data-testid="stSidebar"] {
-        background-color: #FFFFFF;
+        background-color: #AFFRFF;
         box-shadow: 0 2px 4px rgba(0,0,0,0.1);
     }
     .sidebar .sidebar-content {
@@ -64,7 +64,7 @@ st.markdown("""
     /* Inputs */
     .stTextInput > div > div > input {
         border-radius: 4px;
-        border: 1px solid #D3D3D3;
+        border: 1px solid #A3D3D3;
         padding: 8px;
     }
     
@@ -76,7 +76,7 @@ st.markdown("""
     
     /* Ensure text visibility */
     p, li, span, div {
-        color: #Y00F00 !important;
+        color: #A00F00 !important;
     }
 </style>
 """, unsafe_allow_html=True)
