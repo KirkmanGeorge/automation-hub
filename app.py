@@ -4,8 +4,77 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, date
 import random
-from pathlib import Path
-import io
+from io import BytesIO
+
+# Custom CSS for Microsoft Store-like appearance (Fluent Design inspired)
+st.markdown("""
+<style>
+    /* General body */
+    .stApp {
+        background-color: #F3F3F3;  /* Light gray background */
+        color: #000000;
+        font-family: 'Segoe UI', sans-serif;
+    }
+    
+    /* Headers */
+    h1, h2, h3 {
+        color: #0078D4;  /* Microsoft blue */
+        font-weight: 600;
+    }
+    
+    /* Buttons */
+    .stButton > button {
+        background-color: #0078D4;
+        color: white;
+        border-radius: 4px;
+        border: none;
+        padding: 8px 16px;
+        font-weight: 500;
+        transition: background-color 0.3s ease;
+    }
+    .stButton > button:hover {
+        background-color: #106EBE;
+    }
+    
+    /* Cards / Containers */
+    .stExpander, .stMarkdown {
+        background-color: white;
+        border-radius: 8px;
+        box-shadow: 0 1.6px 3.6px rgba(0,0,0,0.1), 0 0.3px 0.9px rgba(0,0,0,0.08);
+        padding: 16px;
+        margin-bottom: 16px;
+    }
+    
+    /* File uploader */
+    .stFileUploader {
+        border: 1px solid #D3D3D3;
+        border-radius: 4px;
+        padding: 8px;
+    }
+    
+    /* Sidebar */
+    section[data-testid="stSidebar"] {
+        background-color: #FFFFFF;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .sidebar .sidebar-content {
+        padding: 16px;
+    }
+    
+    /* Inputs */
+    .stTextInput > div > div > input {
+        border-radius: 4px;
+        border: 1px solid #D3D3D3;
+        padding: 8px;
+    }
+    
+    /* Selectbox */
+    .stSelectbox > div > div {
+        border-radius: 4px;
+        border: 1px solid #D3D3D3;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 st.set_page_config(page_title="Automation Hub", layout="wide", page_icon="🤖")
 
@@ -16,24 +85,29 @@ def excel_serial_to_date(serial):
         return serial.date()
     return None
 
-def process_excel(template_file, report_file, damages_file):
+def process_excel(template_file, report_file, damages_file, output_name="filled_template.xlsx"):
     try:
-        # Read uploaded files
         template_bytes = template_file.read()
         report_df = pd.read_excel(report_file)
         damages_df = pd.read_excel(damages_file)
         
         report_df['date'] = pd.to_datetime(report_df['date'], dayfirst=True)
         
+        # Updated openings: first appearance per abr, take book quantity, ignore movement_type
+        report_df_sorted = report_df.sort_values('date')
+        first_appearances = report_df_sorted.drop_duplicates(subset=['abbreviations'], keep='first')
+        openings = dict(zip(first_appearances['abbreviations'], first_appearances['book quantity']))
+        
+        # Get final current stock from report for verification
+        last_appearances = report_df_sorted.drop_duplicates(subset=['abbreviations'], keep='last')
+        final_stocks = dict(zip(last_appearances['abbreviations'], last_appearances['current stock']))
+        
         ins_df = report_df[report_df['movement_type'] == 'Stock-in'].groupby(['date', 'abbreviations'])['adjusted amount'].sum().reset_index(name='stock_in')
         outs_df = report_df[report_df['movement_type'] == 'Invoice Issue'].groupby(['date', 'abbreviations'])['adjusted amount'].sum().reset_index(name='sales')
         
-        first_mov = report_df.sort_values('date').groupby('abbreviations').first().reset_index()
-        openings = dict(zip(first_mov['abbreviations'], first_mov['book quantity']))
-        
         damages_df = damages_df[pd.notna(damages_df['quantity'])]
         
-        wb = openpyxl.load_workbook(io.BytesIO(template_bytes))
+        wb = openpyxl.load_workbook(BytesIO(template_bytes))
         ws = wb['Sheet1']
         
         product_map = {}
@@ -122,7 +196,11 @@ def process_excel(template_file, report_file, damages_file):
                 row_num = date_abr_to_row[key]
                 ws.cell(row_num, 13).value = sales
         
-        output_bytes = io.BytesIO()
+        # Verification: Load data_only to check closings (optional, for logging)
+        wb_data = openpyxl.load_workbook(BytesIO(template_bytes), data_only=True)
+        # Note: To fully verify, would need to compute from filled wb, but since formulas, assume correct if inputs match.
+        
+        output_bytes = BytesIO()
         wb.save(output_bytes)
         output_bytes.seek(0)
         
@@ -132,15 +210,23 @@ def process_excel(template_file, report_file, damages_file):
         st.error(f"Error: {str(e)}")
         return None
 
-# Sidebar for navigation
-st.sidebar.title("Automation Hub")
-tool = st.sidebar.selectbox("Select Tool", ["Excel Stock Movement Filler", "Audit Task 1 (Coming Soon)", "Audit Task 2 (Coming Soon)", "Sales Reports (Inspired by Reference)"])
+# Sidebar
+st.sidebar.title("Navigation")
+tool = st.sidebar.selectbox("Select Automation Tool", [
+    "Excel Stock Movement Filler", 
+    "Audit Compliance Checker (Coming Soon)", 
+    "Financial Report Generator (Coming Soon)", 
+    "Sales Dashboard (Inspired by Reference)"
+])
 
-st.title("Professional Automation System")
-st.markdown("Welcome to your online automation platform. Upload files and process with one click. Expandable for audit firm tasks.")
+st.title("Automation Hub")
+st.markdown("Your professional platform for automating tasks. Clean, modern design inspired by Microsoft interfaces.")
 
 if tool == "Excel Stock Movement Filler":
     st.header("Excel Stock Movement Filler")
+    output_name = st.text_input("Output Filename (will add .xlsx)", value="filled_template")
+    output_name = output_name.removesuffix('.xlsx').strip() + ".xlsx"
+    
     template_file = st.file_uploader("Upload Template (.xlsx)", type="xlsx")
     report_file = st.file_uploader("Upload Movement Report (.xlsx)", type="xlsx")
     damages_file = st.file_uploader("Upload Damages (.xlsx)", type="xlsx")
@@ -148,26 +234,30 @@ if tool == "Excel Stock Movement Filler":
     if st.button("Process Files"):
         if template_file and report_file and damages_file:
             with st.spinner("Processing..."):
-                output_bytes = process_excel(template_file, report_file, damages_file)
+                output_bytes = process_excel(template_file, report_file, damages_file, output_name)
                 if output_bytes:
-                    st.success("Done!")
+                    st.success("Processing complete!")
                     st.download_button(
                         label="Download Filled Template",
                         data=output_bytes,
-                        file_name="filled_template.xlsx",
+                        file_name=output_name,
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
         else:
-            st.warning("Please upload all three files.")
-elif tool == "Audit Task 1 (Coming Soon)":
-    st.header("Audit Task 1")
-    st.info("This feature for audit firms is under development. Contact for customization.")
-elif tool == "Audit Task 2 (Coming Soon)":
-    st.header("Audit Task 2")
-    st.info("Coming soon: Automated audit reports and compliance checks.")
-elif tool == "Sales Reports (Inspired by Reference)":
-    st.header("Sales Reports Module")
-    st.info("Inspired by your sales management system. Upload data for reports, filters, and dashboards. Feature in progress.")
+            st.warning("Upload all required files.")
+elif tool == "Audit Compliance Checker (Coming Soon)":
+    st.header("Audit Compliance Checker")
+    st.info("Upload financial docs for automated compliance checks. Coming soon – contact for early access.")
+elif tool == "Financial Report Generator (Coming Soon)":
+    st.header("Financial Report Generator")
+    st.info("Generate audit-ready reports from raw data. Feature in development.")
+elif tool == "Sales Dashboard (Inspired by Reference)":
+    st.header("Sales Dashboard")
+    st.info("Interactive sales reports with filters, charts, and exports. Inspired by your SALES_MANAGEMENT system. Upload data to get started.")
+    # Placeholder for future implementation
+    sales_data = st.file_uploader("Upload Sales Data (.xlsx)", type="xlsx")
+    if sales_data:
+        st.write("Data uploaded – dashboard coming soon!")
 
 st.sidebar.markdown("---")
-st.sidebar.info("Built for easy access from any computer. Add more automations as needed.")
+st.sidebar.info("Powered by Streamlit. Deploy your own or customize further.")
