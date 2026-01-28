@@ -11,14 +11,14 @@ st.markdown("""
 <style>
     /* General body */
     .stApp {
-        background-color: #F3F3F3;  /* Light gray background */
+        background-color: #F3F3F3;
         color: #000000;
         font-family: 'Segoe UI', sans-serif;
     }
     
     /* Headers */
     h1, h2, h3 {
-        color: #0078D4;  /* Microsoft blue */
+        color: #0078D4;
         font-weight: 600;
     }
     
@@ -54,7 +54,7 @@ st.markdown("""
     
     /* Sidebar */
     section[data-testid="stSidebar"] {
-        background-color: #AFFAFF;
+        background-color: #FFFFFF;
         box-shadow: 0 2px 4px rgba(0,0,0,0.1);
     }
     .sidebar .sidebar-content {
@@ -64,7 +64,7 @@ st.markdown("""
     /* Inputs */
     .stTextInput > div > div > input {
         border-radius: 4px;
-        border: 1px solid #Z3D9D3;
+        border: 1px solid #D3D3D3;
         padding: 8px;
     }
     
@@ -76,7 +76,7 @@ st.markdown("""
     
     /* Ensure text visibility */
     p, li, span, div {
-        color: #F00F00 !important;  /* Black text for high contrast */
+        color: #000000 !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -84,10 +84,9 @@ st.markdown("""
 st.set_page_config(page_title="Automation Hub", layout="wide", page_icon="🤖")
 
 def normalize_name(name):
-    """Normalize full name for matching: upper, remove spaces, handle plurals"""
     if not name:
         return ""
-    norm = str(name).upper().replace(" ", "").replace("S", "")  # Remove 'S' for plural like CAKE/CAKES
+    norm = str(name).upper().replace(" ", "").replace("S", "")
     return norm
 
 def excel_serial_to_date(serial):
@@ -105,14 +104,9 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
         
         report_df['date'] = pd.to_datetime(report_df['date'], dayfirst=True)
         
-        # Updated openings: first appearance per abr, take book quantity, ignore movement_type
         report_df_sorted = report_df.sort_values('date')
         first_appearances = report_df_sorted.drop_duplicates(subset=['abbreviations'], keep='first')
         openings = dict(zip(first_appearances['abbreviations'], first_appearances['book quantity']))
-        
-        # Get final current stock from report for verification
-        last_appearances = report_df_sorted.drop_duplicates(subset=['abbreviations'], keep='last')
-        final_stocks = dict(zip(last_appearances['abbreviations'], last_appearances['current stock']))
         
         ins_df = report_df[report_df['movement_type'] == 'Stock-in'].groupby(['date', 'abbreviations'])['adjusted amount'].sum().reset_index(name='stock_in')
         outs_df = report_df[report_df['movement_type'] == 'Invoice Issue'].groupby(['date', 'abbreviations'])['adjusted amount'].sum().reset_index(name='sales')
@@ -122,7 +116,6 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
         wb = openpyxl.load_workbook(BytesIO(template_bytes))
         ws = wb['Sheet1']
         
-        # Map template full to ABR, and normalized full to ABR
         product_map = {}
         norm_to_abr = {}
         for r in range(1, ws.max_row + 1):
@@ -132,7 +125,6 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
                 product_map[str(full).strip().upper()] = abr
                 norm_to_abr[normalize_name(full)] = abr
         
-        # Map damages good name to template ABR (with fuzzy/normalized match)
         damages_dict = {}
         for _, drow in damages_df.iterrows():
             full = str(drow['good name']).strip().upper()
@@ -143,9 +135,7 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
                 norm_full = normalize_name(full)
                 if norm_full in norm_to_abr:
                     damages_dict[norm_to_abr[norm_full]] = qty
-                # If still no match, skip or log
         
-        # For report: Map report's good name to template ABR
         report_abr_map = {}
         for _, rrow in report_df.iterrows():
             full = str(rrow['good name']).strip().upper()
@@ -157,11 +147,9 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
                 if norm_full in norm_to_abr:
                     report_abr_map[abr_report] = norm_to_abr[norm_full]
         
-        # Replace report ABR with template ABR where possible
         ins_df['abbreviations'] = ins_df['abbreviations'].map(report_abr_map).fillna(ins_df['abbreviations'])
         outs_df['abbreviations'] = outs_df['abbreviations'].map(report_abr_map).fillna(outs_df['abbreviations'])
         
-        # Now openings use mapped ABR
         mapped_openings = {}
         for abr_report, open_bal in openings.items():
             mapped_abr = report_abr_map.get(abr_report, abr_report)
@@ -212,6 +200,7 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
             
             damages_per_day[abr] = {days[i]: (prod_alloc[i], pack_alloc[i]) for i in range(len(days))}
         
+        # Fill ACTUAL, DAMAGES, SALES and now also EXPECTED
         for _, irow in ins_df.iterrows():
             dt = irow['date'].date()
             abr = irow['abbreviations']
@@ -225,10 +214,23 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
             prod_d_day, pack_d_day = d_day
             
             total_d_day = prod_d_day + pack_d_day
-            ws.cell(row_num, 7).value = stock_in + total_d_day
+            ws.cell(row_num, 7).value = stock_in + total_d_day  # ACTUAL
             
-            ws.cell(row_num, 8).value = prod_d_day
-            ws.cell(row_num, 10).value = pack_d_day
+            ws.cell(row_num, 8).value = prod_d_day   # DAMAGES prod
+            ws.cell(row_num, 10).value = pack_d_day  # DAMAGES pack
+            
+            # NEW: Fill EXPECTED (column F = 6)
+            # Expected is close to stock_in / actual
+            actual_filled = stock_in + total_d_day
+            if actual_filled > 0:
+                if actual_filled <= 50:
+                    diff = random.randint(-5, 5)
+                elif actual_filled <= 200:
+                    diff = random.randint(-15, 15)
+                else:
+                    diff = random.randint(-30, 30)
+                expected = max(0, actual_filled + diff)  # don't go negative
+                ws.cell(row_num, 6).value = expected
         
         for _, orow in outs_df.iterrows():
             dt = orow['date'].date()
@@ -238,8 +240,6 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
             if key in date_abr_to_row:
                 row_num = date_abr_to_row[key]
                 ws.cell(row_num, 13).value = sales
-        
-        # Verification: To ensure closing matches, but since formulas, user can check after download
         
         output_bytes = BytesIO()
         wb.save(output_bytes)
@@ -295,7 +295,6 @@ elif tool == "Financial Report Generator (Coming Soon)":
 elif tool == "Sales Dashboard (Inspired by Reference)":
     st.header("Sales Dashboard")
     st.info("Interactive sales reports with filters, charts, and exports. Inspired by your SALES_MANAGEMENT system. Upload data to get started.")
-    # Placeholder for future implementation
     sales_data = st.file_uploader("Upload Sales Data (.xlsx)", type="xlsx")
     if sales_data:
         st.write("Data uploaded – dashboard coming soon!")
