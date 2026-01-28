@@ -6,19 +6,19 @@ from datetime import datetime, timedelta, date
 import random
 from io import BytesIO
 
-# Custom CSS for Microsoft Store-like appearance (Fluent Design inspired)
+# Custom CSS for Microsoft Store-like appearance (Fluent Design inspired) - fixed colors for visibility
 st.markdown("""
 <style>
     /* General body */
     .stApp {
-        background-color: #O3G3R3;  /* Light gray background */
+        background-color: #F3F3F3;  /* Light gray background */
         color: #000000;
         font-family: 'Segoe UI', sans-serif;
     }
     
     /* Headers */
     h1, h2, h3 {
-        color: #0098Y4;  /* Microsoft blue */
+        color: #0078D4;  /* Microsoft blue */
         font-weight: 600;
     }
     
@@ -54,7 +54,7 @@ st.markdown("""
     
     /* Sidebar */
     section[data-testid="stSidebar"] {
-        background-color: #TFFGFF;
+        background-color: #FFFFFF;
         box-shadow: 0 2px 4px rgba(0,0,0,0.1);
     }
     .sidebar .sidebar-content {
@@ -71,12 +71,24 @@ st.markdown("""
     /* Selectbox */
     .stSelectbox > div > div {
         border-radius: 4px;
-        border: 1px solid #D3B3Y3;
+        border: 1px solid #D3D3D3;
+    }
+    
+    /* Ensure text visibility */
+    p, li, span, div {
+        color: #000000 !important;  /* Black text for high contrast */
     }
 </style>
 """, unsafe_allow_html=True)
 
 st.set_page_config(page_title="Automation Hub", layout="wide", page_icon="🤖")
+
+def normalize_name(name):
+    """Normalize full name for matching: upper, remove spaces, handle plurals"""
+    if not name:
+        return ""
+    norm = str(name).upper().replace(" ", "").replace("S", "")  # Remove 'S' for plural like CAKE/CAKES
+    return norm
 
 def excel_serial_to_date(serial):
     if isinstance(serial, (float, int)):
@@ -110,19 +122,50 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
         wb = openpyxl.load_workbook(BytesIO(template_bytes))
         ws = wb['Sheet1']
         
+        # Map template full to ABR, and normalized full to ABR
         product_map = {}
+        norm_to_abr = {}
         for r in range(1, ws.max_row + 1):
             full = ws.cell(r, 2).value
             abr = ws.cell(r, 3).value
             if full and abr:
                 product_map[str(full).strip().upper()] = abr
+                norm_to_abr[normalize_name(full)] = abr
         
+        # Map damages good name to template ABR (with fuzzy/normalized match)
         damages_dict = {}
         for _, drow in damages_df.iterrows():
             full = str(drow['good name']).strip().upper()
             qty = int(drow['quantity'])
             if full in product_map:
                 damages_dict[product_map[full]] = qty
+            else:
+                norm_full = normalize_name(full)
+                if norm_full in norm_to_abr:
+                    damages_dict[norm_to_abr[norm_full]] = qty
+                # If still no match, skip or log
+        
+        # For report: Map report's good name to template ABR
+        report_abr_map = {}
+        for _, rrow in report_df.iterrows():
+            full = str(rrow['good name']).strip().upper()
+            abr_report = rrow['abbreviations']
+            if full in product_map:
+                report_abr_map[abr_report] = product_map[full]
+            else:
+                norm_full = normalize_name(full)
+                if norm_full in norm_to_abr:
+                    report_abr_map[abr_report] = norm_to_abr[norm_full]
+        
+        # Replace report ABR with template ABR where possible
+        ins_df['abbreviations'] = ins_df['abbreviations'].map(report_abr_map).fillna(ins_df['abbreviations'])
+        outs_df['abbreviations'] = outs_df['abbreviations'].map(report_abr_map).fillna(outs_df['abbreviations'])
+        
+        # Now openings use mapped ABR
+        mapped_openings = {}
+        for abr_report, open_bal in openings.items():
+            mapped_abr = report_abr_map.get(abr_report, abr_report)
+            mapped_openings[mapped_abr] = open_bal
         
         date_abr_to_row = {}
         current_date = None
@@ -136,7 +179,7 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
         
         if date_abr_to_row:
             first_date = min(d[0] for d in date_abr_to_row.keys())
-            for abr, open_bal in openings.items():
+            for abr, open_bal in mapped_openings.items():
                 key = (first_date, abr)
                 if key in date_abr_to_row:
                     row_num = date_abr_to_row[key]
@@ -196,9 +239,7 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
                 row_num = date_abr_to_row[key]
                 ws.cell(row_num, 13).value = sales
         
-        # Verification: Load data_only to check closings (optional, for logging)
-        wb_data = openpyxl.load_workbook(BytesIO(template_bytes), data_only=True)
-        # Note: To fully verify, would need to compute from filled wb, but since formulas, assume correct if inputs match.
+        # Verification: To ensure closing matches, but since formulas, user can check after download
         
         output_bytes = BytesIO()
         wb.save(output_bytes)
@@ -220,7 +261,7 @@ tool = st.sidebar.selectbox("Select Automation Tool", [
 ])
 
 st.title("Automation Hub")
-st.markdown("Your professional platform for automating tasks. Clean, modern design inspired by Microsoft interfaces.")
+st.markdown("Your professional platform for automating tasks. Clean, modern design inspired by Microsoft interfaces. High-contrast for comfortable viewing.")
 
 if tool == "Excel Stock Movement Filler":
     st.header("Excel Stock Movement Filler")
