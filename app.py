@@ -64,7 +64,7 @@ st.markdown("""
     /* Inputs */
     .stTextInput > div > div > input {
         border-radius: 4px;
-        border: 1px solid #D3D3D3;
+        border: 1px solid #Z3D9D3;
         padding: 8px;
     }
     
