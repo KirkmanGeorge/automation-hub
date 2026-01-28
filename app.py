@@ -76,7 +76,7 @@ st.markdown("""
     
     /* Ensure text visibility */
     p, li, span, div {
-        color: #000000 !important;  /* Black text for high contrast */
+        color: #F00F00 !important;  /* Black text for high contrast */
     }
 </style>
 """, unsafe_allow_html=True)
