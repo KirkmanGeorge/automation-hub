@@ -11,7 +11,7 @@ st.markdown("""
 <style>
     /* General body */
     .stApp {
-        background-color: #G3G3G3;  /* Light gray background */
+        background-color: #O3G3R3;  /* Light gray background */
         color: #000000;
         font-family: 'Segoe UI', sans-serif;
     }
