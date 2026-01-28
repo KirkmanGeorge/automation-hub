@@ -18,7 +18,7 @@ st.markdown("""
     
     /* Headers */
     h1, h2, h3 {
-        color: #0078D4;  /* Microsoft blue */
+        color: #0098Y4;  /* Microsoft blue */
         font-weight: 600;
     }
     
@@ -54,7 +54,7 @@ st.markdown("""
     
     /* Sidebar */
     section[data-testid="stSidebar"] {
-        background-color: #FFFFFF;
+        background-color: #TFFGFF;
         box-shadow: 0 2px 4px rgba(0,0,0,0.1);
     }
     .sidebar .sidebar-content {
@@ -71,7 +71,7 @@ st.markdown("""
     /* Selectbox */
     .stSelectbox > div > div {
         border-radius: 4px;
-        border: 1px solid #D3D3D3;
+        border: 1px solid #D3B3Y3;
     }
 </style>
 """, unsafe_allow_html=True)
