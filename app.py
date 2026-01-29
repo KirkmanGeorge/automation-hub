@@ -99,10 +99,29 @@ def excel_serial_to_date(serial):
 def process_excel(template_file, report_file, damages_file, output_name="filled_template.xlsx"):
     try:
         template_bytes = template_file.read()
+        wb_temp = openpyxl.load_workbook(BytesIO(template_bytes))
+        ws_temp = wb_temp['Sheet1']
+        
+        # Find first template date to get year/month
+        template_first_date = None
+        for r in range(1, ws_temp.max_row + 1):
+            date_val = ws_temp.cell(r, 1).value
+            if date_val:
+                template_first_date = excel_serial_to_date(date_val)
+                if template_first_date:
+                    break
+        if not template_first_date:
+            raise ValueError("No dates found in template")
+        
+        template_year = template_first_date.year
+        
         report_df = pd.read_excel(report_file)
         damages_df = pd.read_excel(damages_file)
         
         report_df['date'] = pd.to_datetime(report_df['date'], dayfirst=True)
+        
+        # Adjust report dates to template year (for mismatch cases)
+        report_df['date'] = report_df['date'].apply(lambda d: d.replace(year=template_year))
         
         # Pre-process stock adjustments: subtract from previous stock-in for the product
         report_df_sorted = report_df.sort_values(['abbreviations', 'date'])
@@ -113,22 +132,18 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
             adj_date = adj_row['date']
             adj_amt = adj_row['adjusted amount']
             
-            # Find previous stock-in rows for this abr before adj_date
             prev_ins = report_df_sorted[(report_df_sorted['abbreviations'] == abr) & 
                                         (report_df_sorted['date'] < adj_date) & 
                                         (report_df_sorted['movement_type'] == 'Stock-in')]
             if not prev_ins.empty:
-                # Subtract from the most recent previous stock-in
                 last_prev_idx = prev_ins.index[-1]
                 report_df_sorted.at[last_prev_idx, 'adjusted amount'] -= adj_amt
         
-        # Now use the adjusted report_df_sorted for groupings
         ins_df = report_df_sorted[report_df_sorted['movement_type'] == 'Stock-in'].groupby(['date', 'abbreviations'])['adjusted amount'].sum().reset_index(name='stock_in')
         outs_df = report_df_sorted[report_df_sorted['movement_type'] == 'Invoice Issue'].groupby(['date', 'abbreviations'])['adjusted amount'].sum().reset_index(name='sales')
         
         # Openings: first appearance in the month, use book quantity
-        first_month_date = report_df_sorted['date'].min().replace(day=1)
-        first_appearances = report_df_sorted[report_df_sorted['date'] >= first_month_date].drop_duplicates(subset=['abbreviations'], keep='first')
+        first_appearances = report_df_sorted.drop_duplicates(subset=['abbreviations'], keep='first')
         openings = dict(zip(first_appearances['abbreviations'], first_appearances['book quantity']))
         
         damages_df = damages_df[pd.notna(damages_df['quantity'])]
@@ -220,7 +235,6 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
             
             damages_per_day[abr] = {days[i]: (prod_alloc[i], pack_alloc[i]) for i in range(len(days))}
         
-        # Fill ACTUAL, DAMAGES, SALES and EXPECTED
         for _, irow in ins_df.iterrows():
             dt = irow['date'].date()
             abr = irow['abbreviations']
@@ -234,12 +248,11 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
             prod_d_day, pack_d_day = d_day
             
             total_d_day = prod_d_day + pack_d_day
-            ws.cell(row_num, 7).value = stock_in + total_d_day  # ACTUAL
+            ws.cell(row_num, 7).value = stock_in + total_d_day
             
-            ws.cell(row_num, 8).value = prod_d_day   # DAMAGES prod
-            ws.cell(row_num, 10).value = pack_d_day  # DAMAGES pack
+            ws.cell(row_num, 8).value = prod_d_day
+            ws.cell(row_num, 10).value = pack_d_day
             
-            # Fill EXPECTED (column F = 6)
             actual_filled = stock_in + total_d_day
             if actual_filled > 0:
                 if actual_filled <= 50:
