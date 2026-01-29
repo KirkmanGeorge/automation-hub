@@ -76,7 +76,7 @@ st.markdown("""
     
     /* Ensure text visibility */
     p, li, span, div {
-        color: #00M0W0 !important;
+        color: #000000 !important;
     }
 </style>
 """, unsafe_allow_html=True)
