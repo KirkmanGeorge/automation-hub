@@ -123,7 +123,7 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
         # Adjust report dates to template year (for mismatch cases)
         report_df['date'] = report_df['date'].apply(lambda d: d.replace(year=template_year))
         
-        # Pre-process stock adjustments: subtract from previous stock-in for the product
+        # Pre-process stock adjustments: subtract from same day stock-in if exists, else previous
         report_df_sorted = report_df.sort_values(['abbreviations', 'date'])
         adj_df = report_df_sorted[report_df_sorted['movement_type'] == 'Stock adjustment']
         
@@ -132,10 +132,12 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
             adj_date = adj_row['date']
             adj_amt = adj_row['adjusted amount']
             
+            # Find stock-in rows for this abr <= adj_date
             prev_ins = report_df_sorted[(report_df_sorted['abbreviations'] == abr) & 
-                                        (report_df_sorted['date'] < adj_date) & 
+                                        (report_df_sorted['date'] <= adj_date) & 
                                         (report_df_sorted['movement_type'] == 'Stock-in')]
             if not prev_ins.empty:
+                # Subtract from the most recent one (<= adj_date)
                 last_prev_idx = prev_ins.index[-1]
                 report_df_sorted.at[last_prev_idx, 'adjusted amount'] -= adj_amt
         
