@@ -123,23 +123,32 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
         # Adjust report dates to template year (for mismatch cases)
         report_df['date'] = report_df['date'].apply(lambda d: d.replace(year=template_year))
         
-        # Pre-process stock adjustments: subtract from same day stock-in if exists, else previous
+        # Pre-process stock adjustments: subtract from same day stock-in if exists, else previous; clamp to 0
         report_df_sorted = report_df.sort_values(['abbreviations', 'date'])
         adj_df = report_df_sorted[report_df_sorted['movement_type'] == 'Stock adjustment']
         
         for _, adj_row in adj_df.iterrows():
             abr = adj_row['abbreviations']
             adj_date = adj_row['date']
-            adj_amt = adj_row['adjusted amount']
+            adj_amt = adj_row['adjusted amount']  # Assume positive = reduction
             
-            # Find stock-in rows for this abr <= adj_date
-            prev_ins = report_df_sorted[(report_df_sorted['abbreviations'] == abr) & 
-                                        (report_df_sorted['date'] <= adj_date) & 
-                                        (report_df_sorted['movement_type'] == 'Stock-in')]
-            if not prev_ins.empty:
-                # Subtract from the most recent one (<= adj_date)
-                last_prev_idx = prev_ins.index[-1]
-                report_df_sorted.at[last_prev_idx, 'adjusted amount'] -= adj_amt
+            # First, try same day stock-in
+            same_day_ins = report_df_sorted[(report_df_sorted['abbreviations'] == abr) & 
+                                            (report_df_sorted['date'] == adj_date) & 
+                                            (report_df_sorted['movement_type'] == 'Stock-in')]
+            if not same_day_ins.empty:
+                last_same_idx = same_day_ins.index[-1]
+                new_val = report_df_sorted.at[last_same_idx, 'adjusted amount'] - adj_amt
+                report_df_sorted.at[last_same_idx, 'adjusted amount'] = max(0, new_val)
+            else:
+                # Fall back to previous days
+                prev_ins = report_df_sorted[(report_df_sorted['abbreviations'] == abr) & 
+                                            (report_df_sorted['date'] < adj_date) & 
+                                            (report_df_sorted['movement_type'] == 'Stock-in')]
+                if not prev_ins.empty:
+                    last_prev_idx = prev_ins.index[-1]
+                    new_val = report_df_sorted.at[last_prev_idx, 'adjusted amount'] - adj_amt
+                    report_df_sorted.at[last_prev_idx, 'adjusted amount'] = max(0, new_val)
         
         ins_df = report_df_sorted[report_df_sorted['movement_type'] == 'Stock-in'].groupby(['date', 'abbreviations'])['adjusted amount'].sum().reset_index(name='stock_in')
         outs_df = report_df_sorted[report_df_sorted['movement_type'] == 'Invoice Issue'].groupby(['date', 'abbreviations'])['adjusted amount'].sum().reset_index(name='sales')
@@ -258,11 +267,11 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
             actual_filled = stock_in + total_d_day
             if actual_filled > 0:
                 if actual_filled <= 50:
-                    diff = random.randint(-2, 1)
+                    diff = random.randint(-5, 5)
                 elif actual_filled <= 200:
-                    diff = random.randint(-5, 8)
+                    diff = random.randint(-15, 15)
                 else:
-                    diff = random.randint(-8, 13)
+                    diff = random.randint(-30, 30)
                 expected = max(0, actual_filled + diff)
                 ws.cell(row_num, 6).value = expected
         
