@@ -123,14 +123,14 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
         # Adjust report dates to template year (for mismatch cases)
         report_df['date'] = report_df['date'].apply(lambda d: d.replace(year=template_year))
         
-        # Pre-process stock adjustments: subtract from same day stock-in if exists, else previous; clamp to 0
+        # Pre-process stock adjustments: always subtract the adjustment amount (as reduction) from same day stock-in if exists, else previous; clamp to 0
         report_df_sorted = report_df.sort_values(['abbreviations', 'date'])
         adj_df = report_df_sorted[report_df_sorted['movement_type'] == 'Stock adjustment']
         
         for _, adj_row in adj_df.iterrows():
             abr = adj_row['abbreviations']
             adj_date = adj_row['date']
-            adj_amt = adj_row['adjusted amount']  # Assume positive = reduction
+            adj_amt = abs(adj_row['adjusted amount'])  # Always treat as positive reduction (subtract absolute value)
             
             # First, try same day stock-in
             same_day_ins = report_df_sorted[(report_df_sorted['abbreviations'] == abr) & 
@@ -140,15 +140,16 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
                 last_same_idx = same_day_ins.index[-1]
                 new_val = report_df_sorted.at[last_same_idx, 'adjusted amount'] - adj_amt
                 report_df_sorted.at[last_same_idx, 'adjusted amount'] = max(0, new_val)
-            else:
-                # Fall back to previous days
-                prev_ins = report_df_sorted[(report_df_sorted['abbreviations'] == abr) & 
-                                            (report_df_sorted['date'] < adj_date) & 
-                                            (report_df_sorted['movement_type'] == 'Stock-in')]
-                if not prev_ins.empty:
-                    last_prev_idx = prev_ins.index[-1]
-                    new_val = report_df_sorted.at[last_prev_idx, 'adjusted amount'] - adj_amt
-                    report_df_sorted.at[last_prev_idx, 'adjusted amount'] = max(0, new_val)
+                continue  # Processed, skip to next adjustment
+            
+            # If no same day, fall back to previous days
+            prev_ins = report_df_sorted[(report_df_sorted['abbreviations'] == abr) & 
+                                        (report_df_sorted['date'] < adj_date) & 
+                                        (report_df_sorted['movement_type'] == 'Stock-in')]
+            if not prev_ins.empty:
+                last_prev_idx = prev_ins.index[-1]
+                new_val = report_df_sorted.at[last_prev_idx, 'adjusted amount'] - adj_amt
+                report_df_sorted.at[last_prev_idx, 'adjusted amount'] = max(0, new_val)
         
         ins_df = report_df_sorted[report_df_sorted['movement_type'] == 'Stock-in'].groupby(['date', 'abbreviations'])['adjusted amount'].sum().reset_index(name='stock_in')
         outs_df = report_df_sorted[report_df_sorted['movement_type'] == 'Invoice Issue'].groupby(['date', 'abbreviations'])['adjusted amount'].sum().reset_index(name='sales')
