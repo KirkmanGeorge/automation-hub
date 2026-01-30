@@ -120,41 +120,18 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
         
         report_df['date'] = pd.to_datetime(report_df['date'], dayfirst=True)
         
-        # Adjust report dates to template year (for mismatch cases)
+        # Adjust report dates to template year
         report_df['date'] = report_df['date'].apply(lambda d: d.replace(year=template_year))
         
-        # Pre-process stock adjustments: always subtract the adjustment amount (as reduction) from same day stock-in if exists, else previous; clamp to 0
-        report_df_sorted = report_df.sort_values(['abbreviations', 'date'])
-        adj_df = report_df_sorted[report_df_sorted['movement_type'] == 'Stock adjustment']
+        # Group stock-ins (no change here)
+        ins_df = report_df[report_df['movement_type'] == 'Stock-in'].groupby(['date', 'abbreviations'])['adjusted amount'].sum().reset_index(name='stock_in')
         
-        for _, adj_row in adj_df.iterrows():
-            abr = adj_row['abbreviations']
-            adj_date = adj_row['date']
-            adj_amt = abs(adj_row['adjusted amount'])  # Always treat as positive reduction (subtract absolute value)
-            
-            # First, try same day stock-in
-            same_day_ins = report_df_sorted[(report_df_sorted['abbreviations'] == abr) & 
-                                            (report_df_sorted['date'] == adj_date) & 
-                                            (report_df_sorted['movement_type'] == 'Stock-in')]
-            if not same_day_ins.empty:
-                last_same_idx = same_day_ins.index[-1]
-                new_val = report_df_sorted.at[last_same_idx, 'adjusted amount'] - adj_amt
-                report_df_sorted.at[last_same_idx, 'adjusted amount'] = max(0, new_val)
-                continue  # Processed, skip to next adjustment
-            
-            # If no same day, fall back to previous days
-            prev_ins = report_df_sorted[(report_df_sorted['abbreviations'] == abr) & 
-                                        (report_df_sorted['date'] < adj_date) & 
-                                        (report_df_sorted['movement_type'] == 'Stock-in')]
-            if not prev_ins.empty:
-                last_prev_idx = prev_ins.index[-1]
-                new_val = report_df_sorted.at[last_prev_idx, 'adjusted amount'] - adj_amt
-                report_df_sorted.at[last_prev_idx, 'adjusted amount'] = max(0, new_val)
-        
-        ins_df = report_df_sorted[report_df_sorted['movement_type'] == 'Stock-in'].groupby(['date', 'abbreviations'])['adjusted amount'].sum().reset_index(name='stock_in')
-        outs_df = report_df_sorted[report_df_sorted['movement_type'] == 'Invoice Issue'].groupby(['date', 'abbreviations'])['adjusted amount'].sum().reset_index(name='sales')
+        # Combine Invoice Issue + Stock Adjustment as "sales/outflow"
+        sales_df = report_df[report_df['movement_type'].isin(['Invoice Issue', 'Stock adjustment'])]
+        outs_df = sales_df.groupby(['date', 'abbreviations'])['adjusted amount'].sum().reset_index(name='sales')
         
         # Openings: first appearance in the month, use book quantity
+        report_df_sorted = report_df.sort_values('date')
         first_appearances = report_df_sorted.drop_duplicates(subset=['abbreviations'], keep='first')
         openings = dict(zip(first_appearances['abbreviations'], first_appearances['book quantity']))
         
@@ -247,6 +224,7 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
             
             damages_per_day[abr] = {days[i]: (prod_alloc[i], pack_alloc[i]) for i in range(len(days))}
         
+        # Fill ACTUAL, DAMAGES, SALES (now includes adjustments), and EXPECTED
         for _, irow in ins_df.iterrows():
             dt = irow['date'].date()
             abr = irow['abbreviations']
@@ -260,7 +238,7 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
             prod_d_day, pack_d_day = d_day
             
             total_d_day = prod_d_day + pack_d_day
-            ws.cell(row_num, 7).value = stock_in + total_d_day
+            ws.cell(row_num, 7).value = stock_in + total_d_day  # ACTUAL
             
             ws.cell(row_num, 8).value = prod_d_day
             ws.cell(row_num, 10).value = pack_d_day
@@ -276,10 +254,11 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
                 expected = max(0, actual_filled + diff)
                 ws.cell(row_num, 6).value = expected
         
+        # Sales now includes Invoice Issue + Stock Adjustment
         for _, orow in outs_df.iterrows():
             dt = orow['date'].date()
             abr = orow['abbreviations']
-            sales = orow['sales']
+            sales = orow['sales']  # already summed including adjustments
             key = (dt, abr)
             if key in date_abr_to_row:
                 row_num = date_abr_to_row[key]
