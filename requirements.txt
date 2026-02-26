@@ -1,4 +1,6 @@
 streamlit
 openpyxl
 pandas
+selenium
 numpy
+chromedriver-autoinstaller
