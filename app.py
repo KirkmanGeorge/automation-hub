@@ -6,26 +6,23 @@ from datetime import datetime, timedelta, date
 import random
 from io import BytesIO
 
-# For web automation (new functionality)
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-import time
-
-# ----------------------------
-# Custom CSS (Fluent Design inspired)
-# ----------------------------
+# Custom CSS for Microsoft Store-like appearance (Fluent Design inspired) - fixed colors for visibility
 st.markdown("""
 <style>
+    /* General body */
     .stApp {
         background-color: #F3F3F3;
         color: #000000;
         font-family: 'Segoe UI', sans-serif;
     }
+    
+    /* Headers */
     h1, h2, h3 {
         color: #0078D4;
         font-weight: 600;
     }
+    
+    /* Buttons */
     .stButton > button {
         background-color: #0078D4;
         color: white;
@@ -38,6 +35,8 @@ st.markdown("""
     .stButton > button:hover {
         background-color: #106EBE;
     }
+    
+    /* Cards / Containers */
     .stExpander, .stMarkdown {
         background-color: white;
         border-radius: 8px;
@@ -45,11 +44,15 @@ st.markdown("""
         padding: 16px;
         margin-bottom: 16px;
     }
+    
+    /* File uploader */
     .stFileUploader {
         border: 1px solid #D3D3D3;
         border-radius: 4px;
         padding: 8px;
     }
+    
+    /* Sidebar */
     section[data-testid="stSidebar"] {
         background-color: #FFFFFF;
         box-shadow: 0 2px 4px rgba(0,0,0,0.1);
@@ -57,15 +60,21 @@ st.markdown("""
     .sidebar .sidebar-content {
         padding: 16px;
     }
+    
+    /* Inputs */
     .stTextInput > div > div > input {
         border-radius: 4px;
         border: 1px solid #D3D3D3;
         padding: 8px;
     }
+    
+    /* Selectbox */
     .stSelectbox > div > div {
         border-radius: 4px;
         border: 1px solid #D3D3D3;
     }
+    
+    /* Ensure text visibility */
     p, li, span, div {
         color: #000000 !important;
     }
@@ -73,9 +82,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.set_page_config(page_title="Automation Hub", layout="wide", page_icon="🤖")
-# ----------------------------
-# Helper Functions
-# ----------------------------
+
 def normalize_name(name):
     if not name:
         return ""
@@ -89,16 +96,13 @@ def excel_serial_to_date(serial):
         return serial.date()
     return None
 
-# ----------------------------
-# Existing Function: process_excel
-# ----------------------------
 def process_excel(template_file, report_file, damages_file, output_name="filled_template.xlsx"):
     try:
         template_bytes = template_file.read()
         wb_temp = openpyxl.load_workbook(BytesIO(template_bytes))
         ws_temp = wb_temp['Sheet1']
-
-        # Find first template date
+        
+        # Find first template date to get year/month
         template_first_date = None
         for r in range(1, ws_temp.max_row + 1):
             date_val = ws_temp.cell(r, 1).value
@@ -108,56 +112,57 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
                     break
         if not template_first_date:
             raise ValueError("No dates found in template")
-
+        
         template_year = template_first_date.year
-
+        
         report_df = pd.read_excel(report_file)
         damages_df = pd.read_excel(damages_file)
-
+        
         report_df['date'] = pd.to_datetime(report_df['date'], dayfirst=True)
+        
+        # Adjust report dates to template year (for mismatch cases)
         report_df['date'] = report_df['date'].apply(lambda d: d.replace(year=template_year))
-
-        # Handle stock adjustments
+        
+        # Pre-process stock adjustments: always subtract the adjustment amount (as reduction) from same day stock-in if exists, else previous; clamp to 0
         report_df_sorted = report_df.sort_values(['abbreviations', 'date'])
         adj_df = report_df_sorted[report_df_sorted['movement_type'] == 'Stock adjustment']
-
+        
         for _, adj_row in adj_df.iterrows():
             abr = adj_row['abbreviations']
             adj_date = adj_row['date']
-            adj_amt = abs(adj_row['adjusted amount'])
-
-            same_day_ins = report_df_sorted[(report_df_sorted['abbreviations'] == abr) &
-                                            (report_df_sorted['date'] == adj_date) &
+            adj_amt = abs(adj_row['adjusted amount'])  # Always treat as positive reduction (subtract absolute value)
+            
+            # First, try same day stock-in
+            same_day_ins = report_df_sorted[(report_df_sorted['abbreviations'] == abr) & 
+                                            (report_df_sorted['date'] == adj_date) & 
                                             (report_df_sorted['movement_type'] == 'Stock-in')]
             if not same_day_ins.empty:
                 last_same_idx = same_day_ins.index[-1]
                 new_val = report_df_sorted.at[last_same_idx, 'adjusted amount'] - adj_amt
                 report_df_sorted.at[last_same_idx, 'adjusted amount'] = max(0, new_val)
-                continue
-
-            prev_ins = report_df_sorted[(report_df_sorted['abbreviations'] == abr) &
-                                        (report_df_sorted['date'] < adj_date) &
+                continue  # Processed, skip to next adjustment
+            
+            # If no same day, fall back to previous days
+            prev_ins = report_df_sorted[(report_df_sorted['abbreviations'] == abr) & 
+                                        (report_df_sorted['date'] < adj_date) & 
                                         (report_df_sorted['movement_type'] == 'Stock-in')]
             if not prev_ins.empty:
                 last_prev_idx = prev_ins.index[-1]
                 new_val = report_df_sorted.at[last_prev_idx, 'adjusted amount'] - adj_amt
                 report_df_sorted.at[last_prev_idx, 'adjusted amount'] = max(0, new_val)
-
-        ins_df = report_df_sorted[report_df_sorted['movement_type'] == 'Stock-in'] \
-            .groupby(['date', 'abbreviations'])['adjusted amount'].sum().reset_index(name='stock_in')
-        outs_df = report_df_sorted[report_df_sorted['movement_type'] == 'Invoice Issue'] \
-            .groupby(['date', 'abbreviations'])['adjusted amount'].sum().reset_index(name='sales')
-
-        # Openings
+        
+        ins_df = report_df_sorted[report_df_sorted['movement_type'] == 'Stock-in'].groupby(['date', 'abbreviations'])['adjusted amount'].sum().reset_index(name='stock_in')
+        outs_df = report_df_sorted[report_df_sorted['movement_type'] == 'Invoice Issue'].groupby(['date', 'abbreviations'])['adjusted amount'].sum().reset_index(name='sales')
+        
+        # Openings: first appearance in the month, use book quantity
         first_appearances = report_df_sorted.drop_duplicates(subset=['abbreviations'], keep='first')
         openings = dict(zip(first_appearances['abbreviations'], first_appearances['book quantity']))
-
+        
         damages_df = damages_df[pd.notna(damages_df['quantity'])]
-
+        
         wb = openpyxl.load_workbook(BytesIO(template_bytes))
         ws = wb['Sheet1']
-
-        # Product mapping
+        
         product_map = {}
         norm_to_abr = {}
         for r in range(1, ws.max_row + 1):
@@ -166,8 +171,7 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
             if full and abr:
                 product_map[str(full).strip().upper()] = abr
                 norm_to_abr[normalize_name(full)] = abr
-
-        # Damages mapping
+        
         damages_dict = {}
         for _, drow in damages_df.iterrows():
             full = str(drow['good name']).strip().upper()
@@ -178,8 +182,7 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
                 norm_full = normalize_name(full)
                 if norm_full in norm_to_abr:
                     damages_dict[norm_to_abr[norm_full]] = qty
-
-        # Report mapping
+        
         report_abr_map = {}
         for _, rrow in report_df.iterrows():
             full = str(rrow['good name']).strip().upper()
@@ -190,16 +193,15 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
                 norm_full = normalize_name(full)
                 if norm_full in norm_to_abr:
                     report_abr_map[abr_report] = norm_to_abr[norm_full]
-
+        
         ins_df['abbreviations'] = ins_df['abbreviations'].map(report_abr_map).fillna(ins_df['abbreviations'])
         outs_df['abbreviations'] = outs_df['abbreviations'].map(report_abr_map).fillna(outs_df['abbreviations'])
-
+        
         mapped_openings = {}
         for abr_report, open_bal in openings.items():
             mapped_abr = report_abr_map.get(abr_report, abr_report)
             mapped_openings[mapped_abr] = open_bal
-
-        # Date mapping
+        
         date_abr_to_row = {}
         current_date = None
         for r in range(1, ws.max_row + 1):
@@ -209,7 +211,7 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
             abr = ws.cell(r, 3).value
             if current_date and abr:
                 date_abr_to_row[(current_date, abr)] = r
-
+        
         if date_abr_to_row:
             first_date = min(d[0] for d in date_abr_to_row.keys())
             for abr, open_bal in mapped_openings.items():
@@ -217,8 +219,7 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
                 if key in date_abr_to_row:
                     row_num = date_abr_to_row[key]
                     ws.cell(row_num, 4).value = open_bal
-
-        # Damages allocation
+        
         damages_per_day = {}
         for abr, total_d in damages_dict.items():
             abr_ins = ins_df[ins_df['abbreviations'] == abr]
@@ -230,23 +231,22 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
             if total_stock_in == 0:
                 continue
             weights = stock_ins / total_stock_in
-
+            
             prod_d = int(total_d * 3 / 4)
             pack_d = total_d - prod_d
-
+            
             prod_alloc = np.zeros(len(days), dtype=int)
             for _ in range(prod_d):
                 idx = np.random.choice(len(days), p=weights)
                 prod_alloc[idx] += 1
-
+            
             pack_alloc = np.zeros(len(days), dtype=int)
             for _ in range(pack_d):
                 idx = np.random.choice(len(days), p=weights)
                 pack_alloc[idx] += 1
-
+            
             damages_per_day[abr] = {days[i]: (prod_alloc[i], pack_alloc[i]) for i in range(len(days))}
-
-        # Fill stock-in and damages
+        
         for _, irow in ins_df.iterrows():
             dt = irow['date'].date()
             abr = irow['abbreviations']
@@ -255,15 +255,16 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
             if key not in date_abr_to_row:
                 continue
             row_num = date_abr_to_row[key]
-
+            
             d_day = damages_per_day.get(abr, {}).get(dt, (0, 0))
             prod_d_day, pack_d_day = d_day
-
+            
             total_d_day = prod_d_day + pack_d_day
             ws.cell(row_num, 7).value = stock_in + total_d_day
+            
             ws.cell(row_num, 8).value = prod_d_day
             ws.cell(row_num, 10).value = pack_d_day
-
+            
             actual_filled = stock_in + total_d_day
             if actual_filled > 0:
                 if actual_filled <= 50:
@@ -274,8 +275,7 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
                     diff = random.randint(-6, 12)
                 expected = max(0, actual_filled + diff)
                 ws.cell(row_num, 6).value = expected
-
-        # Fill sales
+        
         for _, orow in outs_df.iterrows():
             dt = orow['date'].date()
             abr = orow['abbreviations']
@@ -284,125 +284,38 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
             if key in date_abr_to_row:
                 row_num = date_abr_to_row[key]
                 ws.cell(row_num, 13).value = sales
-
-        # Save output
+        
         output_bytes = BytesIO()
         wb.save(output_bytes)
         output_bytes.seek(0)
+        
         return output_bytes
-
+    
     except Exception as e:
         st.error(f"Error: {str(e)}")
         return None
-# ----------------------------
-# New Functionality: FDN Invoice Data Extractor
-# ----------------------------
 
-def fetch_invoice_from_ura(fdn):
-    """
-    Automates URA site to validate FDN and fetch invoice details.
-    NOTE: This is a simplified placeholder. In practice, you would
-    use Selenium/Playwright to interact with the site and parse invoice data.
-    """
-    try:
-        # Example Selenium setup (Chrome)
-        options = webdriver.ChromeOptions()
-        options.add_argument("--headless")
-        driver = webdriver.Chrome(options=options)
-
-        driver.get("https://efris.ura.go.ug/")
-        time.sleep(2)
-
-        # Paste FDN into validation field
-        input_box = driver.find_element(By.XPATH, '//input[@placeholder="Enter Fiscal Document Number"]')
-        input_box.send_keys(fdn)
-
-        # Click validate
-        validate_btn = driver.find_element(By.XPATH, '//button[contains(text(),"Validate")]')
-        validate_btn.click()
-        time.sleep(3)
-
-        # Click "View Document"
-        view_btn = driver.find_element(By.XPATH, '//button[contains(text(),"View Document")]')
-        view_btn.click()
-        time.sleep(3)
-
-        # Parse invoice table (simplified example)
-        rows = driver.find_elements(By.XPATH, '//table//tr')
-        items = []
-        for row in rows[1:]:
-            cols = row.find_elements(By.TAG_NAME, 'td')
-            if len(cols) >= 6:
-                items.append({
-                    "description": cols[1].text.strip(),
-                    "quantity": cols[2].text.strip(),
-                    "unit_measure": cols[3].text.strip(),
-                    "unit_price": cols[4].text.strip()
-                })
-
-        driver.quit()
-        return {"items": items}
-
-    except Exception as e:
-        st.error(f"Error fetching invoice for FDN {fdn}: {str(e)}")
-        return {"items": []}
-
-
-def process_fdns(purchases_file):
-    """
-    Reads purchases report, validates each FDN, fetches invoice data,
-    and enriches the Excel with Quantity, Unit Measure, Unit Price.
-    """
-    df = pd.read_excel(purchases_file)
-
-    # Add new columns
-    df["Quantity"] = ""
-    df["Unit Measure"] = ""
-    df["Unit Price"] = ""
-
-    for idx, row in df.iterrows():
-        fdn = str(row["FDN"]).strip()
-        product = str(row["Description of Goods"]).strip().upper()
-
-        invoice_data = fetch_invoice_from_ura(fdn)
-
-        for item in invoice_data["items"]:
-            if product in item["description"].upper():
-                df.at[idx, "Quantity"] = item["quantity"]
-                df.at[idx, "Unit Measure"] = item["unit_measure"]
-                df.at[idx, "Unit Price"] = item["unit_price"]
-                break
-
-    # Save updated Excel
-    output_bytes = BytesIO()
-    df.to_excel(output_bytes, index=False)
-    output_bytes.seek(0)
-    return output_bytes
-# ----------------------------
-# Streamlit UI Integration
-# ----------------------------
+# Sidebar
 st.sidebar.title("Navigation")
 tool = st.sidebar.selectbox("Select Automation Tool", [
-    "Excel Stock Movement Filler",
-    "FDN Invoice Data Extractor",
-    "Audit Compliance Checker (Coming Soon)",
-    "Financial Report Generator (Coming Soon)",
+    "Excel Stock Movement Filler", 
+    "Audit Compliance Checker (Coming Soon)", 
+    "Financial Report Generator (Coming Soon)", 
     "Sales Dashboard (Inspired by Reference)"
 ])
 
 st.title("Automation Hub")
 st.markdown("Your professional platform for automating tasks. Clean, modern design inspired by Microsoft interfaces. High-contrast for comfortable viewing.")
 
-# Excel Stock Movement Filler
 if tool == "Excel Stock Movement Filler":
     st.header("Excel Stock Movement Filler")
     output_name = st.text_input("Output Filename (will add .xlsx)", value="filled_template")
     output_name = output_name.removesuffix('.xlsx').strip() + ".xlsx"
-
+    
     template_file = st.file_uploader("Upload Template (.xlsx)", type="xlsx")
     report_file = st.file_uploader("Upload Movement Report (.xlsx)", type="xlsx")
     damages_file = st.file_uploader("Upload Damages (.xlsx)", type="xlsx")
-
+    
     if st.button("Process Files"):
         if template_file and report_file and damages_file:
             with st.spinner("Processing..."):
@@ -417,38 +330,12 @@ if tool == "Excel Stock Movement Filler":
                     )
         else:
             st.warning("Upload all required files.")
-
-# FDN Invoice Data Extractor
-elif tool == "FDN Invoice Data Extractor":
-    st.header("FDN Invoice Data Extractor")
-    st.info("Validate FDNs, fetch invoice details, and enrich your purchases report automatically.")
-
-    purchases_file = st.file_uploader("Upload Purchases Report (.xlsx)", type="xlsx")
-
-    if st.button("Process Purchases"):
-        if purchases_file:
-            with st.spinner("Validating FDNs and fetching invoice data..."):
-                output_bytes = process_fdns(purchases_file)
-                if output_bytes:
-                    st.success("Processing complete!")
-                    st.download_button(
-                        label="Download Updated Purchases Report",
-                        data=output_bytes,
-                        file_name="updated_purchases.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-        else:
-            st.warning("Upload the purchases report first.")
-
-# Other tools (placeholders)
 elif tool == "Audit Compliance Checker (Coming Soon)":
     st.header("Audit Compliance Checker")
     st.info("Upload financial docs for automated compliance checks. Coming soon – contact for early access.")
-
 elif tool == "Financial Report Generator (Coming Soon)":
     st.header("Financial Report Generator")
     st.info("Generate audit-ready reports from raw data. Feature in development.")
-
 elif tool == "Sales Dashboard (Inspired by Reference)":
     st.header("Sales Dashboard")
     st.info("Interactive sales reports with filters, charts, and exports. Inspired by your SALES_MANAGEMENT system. Upload data to get started.")
@@ -458,4 +345,3 @@ elif tool == "Sales Dashboard (Inspired by Reference)":
 
 st.sidebar.markdown("---")
 st.sidebar.info("Powered by Streamlit. Deploy your own or customize further.")
-
