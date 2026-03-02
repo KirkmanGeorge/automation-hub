@@ -4,3 +4,7 @@ pandas
 selenium
 numpy
 chromedriver-autoinstaller
+pdfplumber
+requests
+chromium-browser
+chromium-chromedriver
