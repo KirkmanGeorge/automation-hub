@@ -12,11 +12,10 @@ try:
     from selenium.webdriver.common.keys import Keys
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
-    from webdriver_manager.chrome import ChromeDriverManager
     import pdfplumber
     import requests
 except ImportError as e:
-    st.error(f"Missing library: {str(e)}. Please install selenium, webdriver-manager, pdfplumber, and requests.")
+    st.error(f"Missing library: {str(e)}. Please add to requirements.txt: selenium, pdfplumber, requests")
 # Custom CSS for Microsoft Store-like appearance (Fluent Design inspired) - fixed colors for visibility
 st.markdown("""
 <style>
@@ -306,15 +305,17 @@ def get_invoice_data(fdn, description):
     # Set up Selenium
     options = Options()
     options.add_argument("--headless")
-    options.add_argument("--disable-gpu")
-    driver = webdriver.Chrome(ChromeDriverManager().install(), options=options)
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.binary_location = "/usr/bin/chromium-browser"
+    driver = webdriver.Chrome("/usr/bin/chromedriver", options=options)
     
     try:
         driver.get("https://efris.ura.go.ug/")
         
         # Wait for the input field - adjust XPath or selector as per actual site structure
         input_field = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.XPATH, '//input[contains(@placeholder, "Fiscal Document Validation") or @id="fdnInput"]'))  # Adjust this XPath
+            EC.presence_of_element_located((By.XPATH, '//input[contains(@placeholder, "Enter Fiscal Document Validation") or @id="fdnInput"]'))  # Adjust this XPath
         )
         input_field.send_keys(str(fdn))
         
@@ -351,17 +352,21 @@ def get_invoice_data(fdn, description):
                         # Assume header is first row
                         header = table[0]
                         # Find indices of columns
-                        desc_idx = header.index("Description") if "Description" in header else 0  # Adjust
-                        qty_idx = header.index("Quantity") if "Quantity" in header else 1
-                        unit_meas_idx = header.index("Unit Measure") if "Unit Measure" in header else 2
-                        unit_price_idx = header.index("Unit Price") if "Unit Price" in header else 3
+                        desc_idx = header.index("Description") if "Description" in header else -1
+                        qty_idx = header.index("Quantity") if "Quantity" in header else -1
+                        unit_meas_idx = header.index("Unit of Measure") if "Unit of Measure" in header else -1
+                        unit_price_idx = header.index("Unit Price") if "Unit Price" in header else -1
+                        
+                        if desc_idx == -1 or qty_idx == -1 or unit_meas_idx == -1 or unit_price_idx == -1:
+                            continue
                         
                         for row in table[1:]:
-                            if description.strip().lower() in row[desc_idx].strip().lower():
+                            row_desc = row[desc_idx].strip() if len(row) > desc_idx else ""
+                            if description.strip().lower() in row_desc.lower():
                                 return {
-                                    'quantity': row[qty_idx],
-                                    'unit_measure': row[unit_meas_idx],
-                                    'unit_price': row[unit_price_idx]
+                                    'quantity': row[qty_idx].strip() if len(row) > qty_idx else "",
+                                    'unit_measure': row[unit_meas_idx].strip() if len(row) > unit_meas_idx else "",
+                                    'unit_price': row[unit_price_idx].strip() if len(row) > unit_price_idx else ""
                                 }
         
         # If not found
