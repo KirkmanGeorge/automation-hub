@@ -8,6 +8,7 @@ from io import BytesIO
 try:
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
     from selenium.webdriver.common.by import By
     from selenium.webdriver.common.keys import Keys
     from selenium.webdriver.support.ui import WebDriverWait
@@ -308,7 +309,8 @@ def get_invoice_data(fdn, description):
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.binary_location = "/usr/bin/chromium-browser"
-    driver = webdriver.Chrome("/usr/bin/chromedriver", options=options)
+    service = Service(executable_path="/usr/bin/chromedriver")
+    driver = webdriver.Chrome(service=service, options=options)
     
     try:
         driver.get("https://efris.ura.go.ug/")
