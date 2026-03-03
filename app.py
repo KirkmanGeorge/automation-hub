@@ -309,7 +309,7 @@ def get_invoice_data(fdn, description):
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    options.binary_location = "/usr/bin/chromium"
+    options.binary_location = "/usr/bin/chromium-browser"
     service = Service(executable_path="/usr/bin/chromedriver")
     driver = webdriver.Chrome(service=service, options=options)
     
@@ -373,7 +373,7 @@ def get_invoice_data(fdn, description):
                                 }
         
         # If not found
-        raise ValueError(f"Product '{description}' not found in invoice for FDN {fdn}")
+        raise ValueValue(f"Product '{description}' not found in invoice for FDN {fdn}")
     
     finally:
         driver.quit()
