@@ -13,10 +13,12 @@ try:
     from selenium.webdriver.common.keys import Keys
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
+    from webdriver_manager.chrome import ChromeDriverManager
+    from webdriver_manager.core.os_manager import ChromeType
     import pdfplumber
     import requests
 except ImportError as e:
-    st.error(f"Missing library: {str(e)}. Please add to requirements.txt: selenium, pdfplumber, requests")
+    st.error(f"Missing library: {str(e)}. Please add to requirements.txt: selenium, pdfplumber, requests, webdriver_manager")
 # Custom CSS for Microsoft Store-like appearance (Fluent Design inspired) - fixed colors for visibility
 st.markdown("""
 <style>
@@ -308,8 +310,8 @@ def get_invoice_data(fdn, description):
     options.add_argument("--headless")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.binary_location = "/usr/bin/chromium-browser"
-    service = Service(executable_path="/usr/bin/chromedriver")
+    options.add_argument("--disable-gpu")
+    service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
     driver = webdriver.Chrome(service=service, options=options)
     
     try:
