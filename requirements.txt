@@ -1,8 +1,8 @@
 streamlit
 openpyxl
 pandas
-selenium
 numpy
-chromedriver-autoinstaller
+selenium
 pdfplumber
 requests
+webdriver_manager
