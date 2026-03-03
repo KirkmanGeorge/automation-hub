@@ -313,7 +313,7 @@ def get_invoice_data(fdn, description):
     options.add_argument("--disable-extensions")
     options.add_argument("--remote-debugging-port=9222")
     options.binary_location = "/usr/bin/chromium-browser"
-    service = Service(executable_path="/usr/bin/chromedriver")
+    service = Service(executable_path="/usr/lib/chromium-browser/chromedriver")
     driver = webdriver.Chrome(service=service, options=options)
     
     try:
@@ -380,6 +380,11 @@ def get_invoice_data(fdn, description):
     
     finally:
         driver.quit()
+
+# Debug to check if driver exists
+import os
+st.write("Chromedriver exists:", os.path.exists("/usr/lib/chromium-browser/chromedriver"))
+st.write("Chromium exists:", os.path.exists("/usr/bin/chromium-browser"))
 
 # Sidebar
 st.sidebar.title("Navigation")
