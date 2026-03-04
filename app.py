@@ -5,12 +5,20 @@ import numpy as np
 from datetime import datetime, timedelta, date
 import random
 from io import BytesIO
+import os
+import subprocess
 try:
-    from playwright.sync_api import sync_playwright
+    from playwright.async_api import async_playwright
     import pdfplumber
     import requests
+    import asyncio
 except ImportError as e:
     st.error(f"Missing library: {str(e)}. Please add to requirements.txt: playwright, pdfplumber, requests")
+
+# One-time Playwright install (runs only if browsers not found)
+if not os.path.exists(os.path.expanduser("~/.cache/ms-playwright")):
+    subprocess.run(["playwright", "install", "--with-deps"], check=True)
+
 # Custom CSS for Microsoft Store-like appearance (Fluent Design inspired) - fixed colors for visibility
 st.markdown("""
 <style>
@@ -296,28 +304,28 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
         st.error(f"Error: {str(e)}")
         return None
 
-def get_invoice_data(fdn, description):
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto("https://efris.ura.go.ug/")
+async def get_invoice_data(fdn, description):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.goto("https://efris.ura.go.ug/")
         
         # Wait for the input field - adjust selector as per actual site structure
-        page.wait_for_selector('input[placeholder="Enter Fiscal Document Validation"]', timeout=10000)  # Adjust selector
-        page.fill('input[placeholder="Enter Fiscal Document Validation"]', str(fdn))
+        await page.wait_for_selector('input[placeholder="Enter Fiscal Document Validation"]', timeout=10000)  # Adjust selector
+        await page.fill('input[placeholder="Enter Fiscal Document Validation"]', str(fdn))
         
         # Assume auto-validate or press enter; if there's a button, click it
-        page.press('input[placeholder="Enter Fiscal Document Validation"]', 'Enter')
-        # Or: page.click('#validateButton')  # Adjust
+        await page.press('input[placeholder="Enter Fiscal Document Validation"]', 'Enter')
+        # Or: await page.click('#validateButton')  # Adjust
        
         # Wait for popup
-        page.wait_for_selector('.popup', timeout=10000)  # Adjust selector for popup
+        await page.wait_for_selector('.popup', timeout=10000)  # Adjust selector for popup
         
         # Click View Document
-        page.click('text="View Document"')  # Adjust selector
+        await page.click('text="View Document"')  # Adjust selector
        
         # Assume it loads the PDF in the same or new tab; get the current URL if it's PDF
-        page.wait_for_url('**.pdf', timeout=10000)  # Wait if URL changes to PDF
+        await page.wait_for_url('**.pdf', timeout=10000)  # Wait if URL changes to PDF
         pdf_url = page.url
         
         # Download PDF
@@ -352,7 +360,11 @@ def get_invoice_data(fdn, description):
         
         # If not found
         raise ValueError(f"Product '{description}' not found in invoice for FDN {fdn}")
-    
+
+# To make it async compatible in Streamlit
+def run_async_get_invoice_data(fdn, description):
+    return asyncio.run(get_invoice_data(fdn, description))
+
 # Sidebar
 st.sidebar.title("Navigation")
 tool = st.sidebar.selectbox("Select Automation Tool", [
@@ -422,7 +434,7 @@ elif tool == "Purchases Report Processor":
                     for index, row in df.iterrows():
                         fdn = row['FDN']
                         description = row['Description of Goods']
-                        data = get_invoice_data(fdn, description)
+                        data = run_async_get_invoice_data(fdn, description)
                         df.at[index, 'Quantity'] = data['quantity']
                         df.at[index, 'Unit Measure'] = data['unit_measure']
                         df.at[index, 'Unit Price'] = data['unit_price']
