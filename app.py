@@ -6,17 +6,11 @@ from datetime import datetime, timedelta, date
 import random
 from io import BytesIO
 try:
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.chrome.service import Service
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.common.keys import Keys
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
+    from playwright.sync_api import sync_playwright
     import pdfplumber
     import requests
 except ImportError as e:
-    st.error(f"Missing library: {str(e)}. Please add to requirements.txt: selenium, pdfplumber, requests")
+    st.error(f"Missing library: {str(e)}. Please add to requirements.txt: playwright, pdfplumber, requests")
 # Custom CSS for Microsoft Store-like appearance (Fluent Design inspired) - fixed colors for visibility
 st.markdown("""
 <style>
@@ -303,47 +297,28 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
         return None
 
 def get_invoice_data(fdn, description):
-    # Set up Selenium
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--disable-infobars")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--remote-debugging-port=9222")
-    options.binary_location = "/usr/bin/chromium-browser"
-    service = Service(executable_path="/usr/lib/chromium-browser/chromedriver")
-    driver = webdriver.Chrome(service=service, options=options)
-    
-    try:
-        driver.get("https://efris.ura.go.ug/")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.goto("https://efris.ura.go.ug/")
         
-        # Wait for the input field - adjust XPath or selector as per actual site structure
-        input_field = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.XPATH, '//input[contains(@placeholder, "Enter Fiscal Document Validation") or @id="fdnInput"]'))  # Adjust this XPath
-        )
-        input_field.send_keys(str(fdn))
+        # Wait for the input field - adjust selector as per actual site structure
+        page.wait_for_selector('input[placeholder="Enter Fiscal Document Validation"]', timeout=10000)  # Adjust selector
+        page.fill('input[placeholder="Enter Fiscal Document Validation"]', str(fdn))
         
         # Assume auto-validate or press enter; if there's a button, click it
-        input_field.send_keys(Keys.ENTER)
-        # Or: validate_button = driver.find_element(By.ID, "validateButton")  # Adjust
-        # validate_button.click()
-        
+        page.press('input[placeholder="Enter Fiscal Document Validation"]', 'Enter')
+        # Or: page.click('#validateButton')  # Adjust
+       
         # Wait for popup
-        popup = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CLASS_NAME, "popup"))  # Adjust selector for popup
-        )
+        page.wait_for_selector('.popup', timeout=10000)  # Adjust selector for popup
         
         # Click View Document
-        view_button = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.XPATH, '//button[text()="View Document"]'))  # Adjust XPath
-        )
-        view_button.click()
-        
+        page.click('text="View Document"')  # Adjust selector
+       
         # Assume it loads the PDF in the same or new tab; get the current URL if it's PDF
-        WebDriverWait(driver, 10).until(EC.url_contains(".pdf"))  # Wait if URL changes to PDF
-        pdf_url = driver.current_url
+        page.wait_for_url('**.pdf', timeout=10000)  # Wait if URL changes to PDF
+        pdf_url = page.url
         
         # Download PDF
         response = requests.get(pdf_url)
@@ -378,14 +353,6 @@ def get_invoice_data(fdn, description):
         # If not found
         raise ValueError(f"Product '{description}' not found in invoice for FDN {fdn}")
     
-    finally:
-        driver.quit()
-
-# Debug to check if driver exists
-import os
-st.write("Chromedriver exists:", os.path.exists("/usr/lib/chromium-browser/chromedriver"))
-st.write("Chromium exists:", os.path.exists("/usr/bin/chromium-browser"))
-
 # Sidebar
 st.sidebar.title("Navigation")
 tool = st.sidebar.selectbox("Select Automation Tool", [
