@@ -4,4 +4,4 @@ pandas
 numpy
 pdfplumber
 requests
-playwright
+playwright==1.41.0  # Stable version that works on cloud
