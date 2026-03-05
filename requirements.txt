@@ -3,4 +3,3 @@ openpyxl
 pandas
 numpy
 selenium
-webdriver-manager
