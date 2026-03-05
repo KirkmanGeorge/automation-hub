@@ -1,3 +1,22 @@
+# ── Auto-install Playwright Chromium browser on first run (Streamlit Cloud) ──
+# Uses a sentinel file so install only runs once per container, not every rerun.
+import subprocess
+import sys
+import os
+
+_SENTINEL = os.path.join(os.path.expanduser("~"), ".pw_chromium_installed")
+if not os.path.exists(_SENTINEL):
+    subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        capture_output=True, text=True, timeout=300
+    )
+    subprocess.run(
+        [sys.executable, "-m", "playwright", "install-deps", "chromium"],
+        capture_output=True, text=True, timeout=300
+    )
+    open(_SENTINEL, "w").close()
+# ─────────────────────────────────────────────────────────────────────────────
+
 import streamlit as st
 import openpyxl
 import pandas as pd
@@ -7,6 +26,7 @@ import random
 from io import BytesIO
 import asyncio
 import difflib
+
 
 # Custom CSS for Microsoft Store-like appearance (Fluent Design inspired) - fixed colors for visibility
 st.markdown("""
