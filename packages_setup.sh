@@ -1,1 +1,1 @@
-playwright install chromium
+
