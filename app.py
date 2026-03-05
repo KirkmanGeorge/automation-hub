@@ -6,12 +6,10 @@ import os
 
 _SENTINEL = os.path.join(os.path.expanduser("~"), ".pw_chromium_installed")
 if not os.path.exists(_SENTINEL):
+    # Download the Chromium binary.
+    # System libraries are handled by packages.txt (apt-installed by Streamlit Cloud as root).
     subprocess.run(
         [sys.executable, "-m", "playwright", "install", "chromium"],
-        capture_output=True, text=True, timeout=300
-    )
-    subprocess.run(
-        [sys.executable, "-m", "playwright", "install-deps", "chromium"],
         capture_output=True, text=True, timeout=300
     )
     open(_SENTINEL, "w").close()
