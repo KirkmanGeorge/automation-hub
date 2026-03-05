@@ -1,20 +1,6 @@
-# ── Auto-install Playwright Chromium browser on first run (Streamlit Cloud) ──
-# Uses a sentinel file so install only runs once per container, not every rerun.
-import subprocess
-import sys
-import os
-
-_SENTINEL = os.path.join(os.path.expanduser("~"), ".pw_chromium_installed")
-if not os.path.exists(_SENTINEL):
-    # Download the Chromium binary.
-    # System libraries are handled by packages.txt (apt-installed by Streamlit Cloud as root).
-    subprocess.run(
-        [sys.executable, "-m", "playwright", "install", "chromium"],
-        capture_output=True, text=True, timeout=300
-    )
-    open(_SENTINEL, "w").close()
-# ─────────────────────────────────────────────────────────────────────────────
-
+# ── Chromium is installed via packages.txt (apt) so all system libs are present.
+# We point Playwright at the system binary directly — no download needed.
+import subprocess, sys, os
 import streamlit as st
 import openpyxl
 import pandas as pd
@@ -459,7 +445,7 @@ def run_efris_enrichment(purchases_df: pd.DataFrame, log_placeholder, progress_b
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        st.error("Playwright is not installed. Add `playwright` to your requirements.txt and run `playwright install chromium`.")
+        st.error("Playwright is not installed. Add `playwright` to your requirements.txt.")
         return purchases_df
 
     # Add output columns if they don't exist
@@ -484,7 +470,22 @@ def run_efris_enrichment(purchases_df: pd.DataFrame, log_placeholder, progress_b
     fdn_cache: dict[str, list[dict]] = {}
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        # Resolve system Chromium path (apt-installed via packages.txt)
+        # Tries common paths; falls back to Playwright's own download if present.
+        _CHROME_CANDIDATES = [
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+            "/snap/bin/chromium",
+        ]
+        _chrome_path = next((p for p in _CHROME_CANDIDATES if os.path.exists(p)), None)
+        _launch_kwargs = dict(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                  "--single-process", "--no-zygote"]
+        )
+        if _chrome_path:
+            _launch_kwargs["executable_path"] = _chrome_path
+        browser = pw.chromium.launch(**_launch_kwargs)
         context = browser.new_context(viewport={"width": 1280, "height": 900})
         page = context.new_page()
 
