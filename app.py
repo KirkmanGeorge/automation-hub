@@ -1,32 +1,5 @@
-import subprocess, sys, os, time
+import os, time
 import streamlit as st
-
-# ─── Install Chromium at runtime (runs once via sentinel file) ────────────────
-# packages.txt is unreliable on Streamlit Cloud — we do it ourselves here.
-_SENTINEL = os.path.expanduser("~/.chromium_ready")
-if not os.path.exists(_SENTINEL):
-    with st.spinner("⚙️ First-time setup: installing Chromium (takes ~60s)..."):
-        cmds = [
-            ["apt-get", "update", "-qq"],
-            ["apt-get", "install", "-y", "-qq",
-             "chromium", "chromium-driver",
-             "libglib2.0-0", "libnss3", "libatk1.0-0",
-             "libatk-bridge2.0-0", "libcups2", "libdrm2",
-             "libxkbcommon0", "libxcomposite1", "libxdamage1",
-             "libxfixes3", "libxrandr2", "libgbm1",
-             "libasound2", "libpango-1.0-0", "libcairo2"],
-        ]
-        for cmd in cmds:
-            subprocess.run(cmd, capture_output=True)
-        # Try snap chromium as fallback
-        r = subprocess.run(["which", "chromium"], capture_output=True, text=True)
-        if not r.stdout.strip():
-            subprocess.run(["apt-get", "install", "-y", "-qq", "chromium-browser", "chromium-chromedriver"],
-                           capture_output=True)
-        open(_SENTINEL, "w").close()
-    st.rerun()
-# ─────────────────────────────────────────────────────────────────────────────
-
 import openpyxl
 import pandas as pd
 import numpy as np
@@ -47,13 +20,12 @@ st.markdown("""
     .stButton > button:hover { background-color: #106EBE; }
     .stExpander, .stMarkdown {
         background-color: white; border-radius: 8px;
-        box-shadow: 0 1.6px 3.6px rgba(0,0,0,0.1), 0 0.3px 0.9px rgba(0,0,0,0.08);
+        box-shadow: 0 1.6px 3.6px rgba(0,0,0,0.1);
         padding: 16px; margin-bottom: 16px;
     }
     .stFileUploader { border: 1px solid #D3D3D3; border-radius: 4px; padding: 8px; }
-    section[data-testid="stSidebar"] { background-color: #FFFFFF; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    section[data-testid="stSidebar"] { background-color: #FFFFFF; }
     .stTextInput > div > div > input { border-radius: 4px; border: 1px solid #D3D3D3; padding: 8px; }
-    .stSelectbox > div > div { border-radius: 4px; border: 1px solid #D3D3D3; }
     p, li, span, div { color: #000000 !important; }
     .log-box {
         background: #1e1e1e; color: #00ff88; font-family: monospace;
@@ -231,19 +203,10 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NEW TOOL: EFRIS Invoice Enricher
+# NEW TOOL: EFRIS Invoice Enricher — Selenium + Chromium (installed via Dockerfile)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _find_binary(names):
-    """Return the first existing path from a list of candidates."""
-    import shutil
-    for n in names:
-        p = shutil.which(n) or (n if os.path.exists(n) else None)
-        if p:
-            return p
-    return None
-
-def _get_chrome_driver():
+def _get_driver():
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
@@ -258,31 +221,24 @@ def _get_chrome_driver():
     options.add_argument("--single-process")
     options.add_argument("--no-zygote")
 
-    browser = _find_binary([
-        "chromium", "chromium-browser",
-        "/usr/bin/chromium", "/usr/bin/chromium-browser",
-        "google-chrome", "google-chrome-stable",
-    ])
-    driver_bin = _find_binary([
-        "chromedriver",
-        "/usr/bin/chromedriver",
-        "/usr/lib/chromium/chromedriver",
-        "/usr/lib/chromium-browser/chromedriver",
-    ])
+    # Read paths set in Dockerfile ENV
+    browser_path  = os.environ.get("CHROMIUM_PATH",    "/usr/bin/chromium")
+    driver_path   = os.environ.get("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
 
-    if browser:
-        options.binary_location = browser
-    if driver_bin:
-        return webdriver.Chrome(service=Service(executable_path=driver_bin), options=options)
+    # Fallback candidates in case ENV vars differ
+    for bp in [browser_path, "/usr/bin/chromium", "/usr/bin/chromium-browser",
+               "/usr/bin/google-chrome"]:
+        if os.path.exists(bp):
+            options.binary_location = bp
+            break
 
-    # Last resort: webdriver-manager
-    from webdriver_manager.chrome import ChromeDriverManager
-    from webdriver_manager.core.os_manager import ChromeType
-    try:
-        drv = ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()
-    except Exception:
-        drv = ChromeDriverManager().install()
-    return webdriver.Chrome(service=Service(executable_path=drv), options=options)
+    for dp in [driver_path, "/usr/bin/chromedriver",
+               "/usr/lib/chromium/chromedriver",
+               "/usr/lib/chromium-browser/chromedriver"]:
+        if os.path.exists(dp):
+            return webdriver.Chrome(service=Service(executable_path=dp), options=options)
+
+    raise RuntimeError("chromedriver not found. Make sure the Dockerfile installed chromium-driver.")
 
 
 def _scrape_fdn(driver, fdn):
@@ -293,26 +249,40 @@ def _scrape_fdn(driver, fdn):
     try:
         driver.get("https://efris.ura.go.ug/")
         wait = WebDriverWait(driver, 20)
+
+        # Paste FDN into the validation box
         fdn_input = wait.until(EC.presence_of_element_located((By.XPATH,
             "//input[contains(@placeholder,'Fiscal Document') or "
             "contains(@placeholder,'fiscal') or contains(@placeholder,'FDN')]")))
         fdn_input.clear()
         fdn_input.send_keys(str(fdn))
         time.sleep(0.4)
+
+        # Click Validate
         validate_btn = wait.until(EC.element_to_be_clickable((By.XPATH,
-            "//button[contains(translate(.,'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'VALIDATE')]")))
+            "//button[contains(translate(.,'abcdefghijklmnopqrstuvwxyz',"
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'VALIDATE')]")))
         validate_btn.click()
         time.sleep(3)
+
+        # Wait for popup
         wait.until(EC.presence_of_element_located((By.XPATH,
             "//*[contains(text(),'erified') or contains(text(),'Validation Report')]")))
         time.sleep(1)
+
+        # Click View Document
         view_btn = wait.until(EC.element_to_be_clickable((By.XPATH,
-            "//button[contains(translate(.,'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'VIEW DOCUMENT')]")))
+            "//button[contains(translate(.,'abcdefghijklmnopqrstuvwxyz',"
+            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'VIEW DOCUMENT')]")))
         view_btn.click()
         time.sleep(4)
+
+        # Switch to new tab if opened
         if len(driver.window_handles) > 1:
             driver.switch_to.window(driver.window_handles[-1])
             time.sleep(2)
+
+        # Scrape invoice table
         for table in driver.find_elements(By.TAG_NAME, "table"):
             rows = table.find_elements(By.TAG_NAME, "tr")
             header_idx, col_map = None, {}
@@ -334,16 +304,18 @@ def _scrape_fdn(driver, fdn):
                         ix = col_map.get(key, fb)
                         return texts[ix] if ix < len(texts) else ""
                     item_name = _g("item", 1)
-                    qty = _g("quantity", 2)
+                    qty       = _g("quantity", 2)
                     if item_name and qty:
                         items.append({"item": item_name, "quantity": qty,
                                       "unit_measure": _g("unit_measure", 3),
-                                      "unit_price": _g("unit_price", 4)})
+                                      "unit_price":   _g("unit_price", 4)})
             if items:
                 break
+
         if len(driver.window_handles) > 1:
             driver.close()
             driver.switch_to.window(driver.window_handles[0])
+
     except Exception:
         try:
             if len(driver.window_handles) > 1:
@@ -365,6 +337,7 @@ def run_efris_enrichment(purchases_df, log_placeholder, progress_bar):
     for col in ["Quantity", "Unit Measure", "Unit Price"]:
         if col not in purchases_df.columns:
             purchases_df[col] = None
+
     total, log_lines = len(purchases_df), []
 
     def log(msg):
@@ -373,18 +346,16 @@ def run_efris_enrichment(purchases_df, log_placeholder, progress_bar):
             '<div class="log-box">' + "<br>".join(log_lines[-60:]) + "</div>",
             unsafe_allow_html=True)
 
-    # Show what binaries are available after our install
-    import shutil
-    for name in ["chromium", "chromium-browser", "chromedriver"]:
-        p = shutil.which(name)
-        log(f"{'✅' if p else '❌'}  {name}  →  {p or 'not found'}")
+    # Show binary status
+    for p in ["/usr/bin/chromium", "/usr/bin/chromedriver"]:
+        log(f"{'✅' if os.path.exists(p) else '❌'}  {p}")
 
     log("🚀  Starting browser...")
     try:
-        driver = _get_chrome_driver()
+        driver = _get_driver()
         log("✅  Browser started!")
     except Exception as e:
-        st.error(f"Browser failed to start: {e}")
+        st.error(f"Browser failed: {e}")
         return purchases_df
 
     fdn_cache = {}
@@ -394,32 +365,38 @@ def run_efris_enrichment(purchases_df, log_placeholder, progress_bar):
             desc = str(row.get("Description of Goods", "")).strip()
             row_num = idx + 2
             progress_bar.progress((idx + 1) / total, text=f"Row {idx+1}/{total} — FDN: {fdn}")
+
             if not fdn or fdn.lower() == "nan":
                 log(f"[Row {row_num}] ⚠️  Skipped — no FDN")
                 continue
+
             if fdn not in fdn_cache:
-                log(f"[Row {row_num}] 🔍  FDN: {fdn}  |  Product: {desc}")
+                log(f"[Row {row_num}] 🔍  FDN: {fdn}  |  {desc}")
                 try:
                     fdn_cache[fdn] = _scrape_fdn(driver, fdn)
                     log(f"[Row {row_num}] ✅  {len(fdn_cache[fdn])} item(s) found")
                 except Exception as e:
                     fdn_cache[fdn] = []
-                    log(f"[Row {row_num}] ❌  Error: {e}")
+                    log(f"[Row {row_num}] ❌  {e}")
             else:
                 log(f"[Row {row_num}] 📋  Cached — FDN: {fdn}")
+
             invoice_items = fdn_cache[fdn]
             if not invoice_items:
-                log(f"[Row {row_num}] ⚠️  No items — FDN: {fdn}")
+                log(f"[Row {row_num}] ⚠️  No items for FDN: {fdn}")
                 continue
+
             invoice_names = [i["item"] for i in invoice_items]
             matched = fuzzy_match_product(desc, invoice_names)
             if matched:
-                hit = next((i for i in invoice_items if i["item"].strip().upper() == matched.strip().upper()), None)
+                hit = next((i for i in invoice_items
+                            if i["item"].strip().upper() == matched.strip().upper()), None)
                 if hit:
                     purchases_df.at[idx, "Quantity"]     = hit["quantity"]
                     purchases_df.at[idx, "Unit Measure"] = hit["unit_measure"]
                     purchases_df.at[idx, "Unit Price"]   = hit["unit_price"]
-                    log(f"[Row {row_num}] ✔️  '{desc}' → Qty:{hit['quantity']}  Unit:{hit['unit_measure']}  Price:{hit['unit_price']}")
+                    log(f"[Row {row_num}] ✔️  '{desc}' → "
+                        f"Qty:{hit['quantity']}  Unit:{hit['unit_measure']}  Price:{hit['unit_price']}")
                 else:
                     log(f"[Row {row_num}] ⚠️  Lookup failed: {matched}")
             else:
@@ -429,6 +406,7 @@ def run_efris_enrichment(purchases_df, log_placeholder, progress_bar):
             driver.quit()
         except Exception:
             pass
+
     log("🏁  All rows processed.")
     return purchases_df
 
@@ -472,7 +450,7 @@ tool = st.sidebar.selectbox("Select Automation Tool", [
 ])
 
 st.title("Automation Hub")
-st.markdown("Your professional platform for automating tasks. Clean, modern design inspired by Microsoft interfaces.")
+st.markdown("Your professional platform for automating tasks.")
 
 if tool == "Excel Stock Movement Filler":
     st.header("Excel Stock Movement Filler")
@@ -496,13 +474,10 @@ if tool == "Excel Stock Movement Filler":
 elif tool == "EFRIS Invoice Enricher":
     st.header("EFRIS Invoice Enricher")
     st.markdown("""
-    Upload your **Purchases Report** (.xlsx). The tool will:
-    1. Read each row's **FDN** and **Description of Goods**
-    2. Open EFRIS in a headless browser, validate each FDN and view the invoice
-    3. Match the product and extract **Quantity**, **Unit Measure**, **Unit Price**
-    4. Generate a downloadable enriched Excel file (new columns highlighted in yellow)
+    Upload your **Purchases Report** (.xlsx). The tool will validate each FDN on EFRIS
+    and fill in **Quantity**, **Unit Measure**, and **Unit Price** for every row.
 
-    > ⚠️ May take several minutes for large files. Each unique FDN is only scraped once.
+    > Each unique FDN is only fetched once — duplicates use cached data.
     """)
     col1, col2 = st.columns([2, 1])
     with col1:
@@ -523,8 +498,7 @@ elif tool == "EFRIS Invoice Enricher":
         except Exception as e:
             st.error(f"Could not read file: {e}")
             purchases_file = None
-    if st.button("🚀 Start EFRIS Validation & Enrichment",
-                 disabled=(purchases_file is None), key="efris_run"):
+    if st.button("🚀 Start EFRIS Enrichment", disabled=(purchases_file is None), key="efris_run"):
         st.markdown("---")
         st.markdown("### Live Progress")
         progress_bar    = st.progress(0, text="Starting...")
@@ -545,18 +519,18 @@ elif tool == "EFRIS Invoice Enricher":
 
 elif tool == "Audit Compliance Checker (Coming Soon)":
     st.header("Audit Compliance Checker")
-    st.info("Upload financial docs for automated compliance checks. Coming soon.")
+    st.info("Coming soon – contact for early access.")
 
 elif tool == "Financial Report Generator (Coming Soon)":
     st.header("Financial Report Generator")
-    st.info("Generate audit-ready reports from raw data. Feature in development.")
+    st.info("Feature in development.")
 
 elif tool == "Sales Dashboard (Inspired by Reference)":
     st.header("Sales Dashboard")
-    st.info("Interactive sales reports with filters, charts, and exports. Upload data to get started.")
+    st.info("Upload data to get started.")
     sales_data = st.file_uploader("Upload Sales Data (.xlsx)", type="xlsx")
     if sales_data:
         st.write("Data uploaded – dashboard coming soon!")
 
 st.sidebar.markdown("---")
-st.sidebar.info("Powered by Streamlit. Deploy your own or customize further.")
+st.sidebar.info("Powered by Streamlit on Railway.")
