@@ -2,4 +2,4 @@ streamlit
 openpyxl
 pandas
 numpy
-playwright
+selenium
