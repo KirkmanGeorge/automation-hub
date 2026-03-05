@@ -1,4 +1,4 @@
-import subprocess, sys, os
+import subprocess, sys, os, time
 import streamlit as st
 import openpyxl
 import pandas as pd
@@ -7,7 +7,6 @@ from datetime import datetime, timedelta, date
 import random
 from io import BytesIO
 import difflib
-import time
 
 st.markdown("""
 <style>
@@ -205,15 +204,24 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NEW TOOL: EFRIS Invoice Enricher — Selenium + system Chromium (packages.txt)
+# NEW TOOL: EFRIS Invoice Enricher
+# Browser setup: tries system Chromium first, falls back to webdriver-manager
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_chrome_driver():
+    """
+    Build a headless Selenium Chrome driver.
+
+    Strategy (in order):
+    1. Use system chromium-browser + system chromedriver  (installed via packages.txt)
+    2. Fall back to webdriver-manager to auto-download a matching chromedriver
+    """
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
+
     options = Options()
-    options.add_argument("--headless")
+    options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
@@ -221,20 +229,56 @@ def _get_chrome_driver():
     options.add_argument("--disable-extensions")
     options.add_argument("--single-process")
     options.add_argument("--no-zygote")
-    # Point to system Chromium binary installed via packages.txt
-    for bin_path in ["/usr/bin/chromium-browser", "/usr/bin/chromium",
-                     "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"]:
-        if os.path.exists(bin_path):
-            options.binary_location = bin_path
-            break
-    # Point to matching chromedriver
-    for drv_path in ["/usr/bin/chromedriver",
-                     "/usr/lib/chromium-browser/chromedriver",
-                     "/usr/lib/chromium/chromedriver"]:
-        if os.path.exists(drv_path):
+    options.add_argument("--remote-debugging-port=0")
+
+    # ── Detect system Chromium binary ─────────────────────────────────────────
+    browser_candidates = [
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
+        "/snap/bin/chromium",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+    ]
+    system_browser = next((p for p in browser_candidates if os.path.exists(p)), None)
+
+    # ── Detect system chromedriver ────────────────────────────────────────────
+    driver_candidates = [
+        "/usr/lib/chromium-browser/chromedriver",
+        "/usr/bin/chromedriver",
+        "/usr/lib/chromium/chromedriver",
+        "/snap/bin/chromedriver",
+    ]
+    system_driver = next((p for p in driver_candidates if os.path.exists(p)), None)
+
+    # ── Strategy 1: both system binaries found ────────────────────────────────
+    if system_browser and system_driver:
+        options.binary_location = system_browser
+        return webdriver.Chrome(service=Service(executable_path=system_driver), options=options)
+
+    # ── Strategy 2: system browser found, use webdriver-manager for driver ────
+    if system_browser:
+        options.binary_location = system_browser
+        try:
+            from webdriver_manager.chrome import ChromeDriverManager
+            from webdriver_manager.core.os_manager import ChromeType
+            drv_path = ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()
             return webdriver.Chrome(service=Service(executable_path=drv_path), options=options)
-    # Fallback: let selenium-manager resolve (selenium >= 4.10)
-    return webdriver.Chrome(options=options)
+        except Exception:
+            pass
+
+    # ── Strategy 3: no system browser — let webdriver-manager download both ───
+    # (works on local machines; may fail on restricted cloud envs)
+    try:
+        from webdriver_manager.chrome import ChromeDriverManager
+        drv_path = ChromeDriverManager().install()
+        return webdriver.Chrome(service=Service(executable_path=drv_path), options=options)
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not start a browser.\n\n"
+            f"Make sure your repo contains a packages.txt with:\n"
+            f"  chromium-browser\n  chromium-chromedriver\n\n"
+            f"Internal error: {e}"
+        )
 
 
 def _scrape_fdn(driver, fdn):
@@ -244,26 +288,44 @@ def _scrape_fdn(driver, fdn):
     items = []
     try:
         driver.get("https://efris.ura.go.ug/")
-        wait = WebDriverWait(driver, 15)
+        wait = WebDriverWait(driver, 20)
+
+        # Paste FDN
         fdn_input = wait.until(EC.presence_of_element_located((By.XPATH,
-            "//input[contains(@placeholder,'Fiscal Document') or contains(@placeholder,'fiscal')]")))
+            "//input[contains(@placeholder,'Fiscal Document') or "
+            "contains(@placeholder,'fiscal') or contains(@placeholder,'FDN')]"
+        )))
         fdn_input.clear()
         fdn_input.send_keys(str(fdn))
-        time.sleep(0.3)
+        time.sleep(0.4)
+
+        # Click Validate
         validate_btn = wait.until(EC.element_to_be_clickable((By.XPATH,
-            "//button[contains(translate(text(),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'VALIDATE')]")))
+            "//button[contains(translate(., 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'VALIDATE')]"
+        )))
         validate_btn.click()
         time.sleep(3)
+
+        # Wait for verification popup
         wait.until(EC.presence_of_element_located((By.XPATH,
-            "//*[contains(text(),'verified') or contains(text(),'Verified') or contains(text(),'Validation Report')]")))
-        time.sleep(0.8)
+            "//*[contains(text(),'verified') or contains(text(),'Verified') "
+            "or contains(text(),'Validation Report') or contains(text(),'VERIFIED')]"
+        )))
+        time.sleep(1)
+
+        # Click View Document
         view_btn = wait.until(EC.element_to_be_clickable((By.XPATH,
-            "//button[contains(translate(text(),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'VIEW DOCUMENT')]")))
+            "//button[contains(translate(., 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'VIEW DOCUMENT')]"
+        )))
         view_btn.click()
         time.sleep(4)
+
+        # Switch to new tab if opened
         if len(driver.window_handles) > 1:
             driver.switch_to.window(driver.window_handles[-1])
             time.sleep(2)
+
+        # Scrape invoice table
         for table in driver.find_elements(By.TAG_NAME, "table"):
             rows       = table.find_elements(By.TAG_NAME, "tr")
             header_idx = None
@@ -294,9 +356,11 @@ def _scrape_fdn(driver, fdn):
                                       "unit_measure": unit_m, "unit_price": unit_p})
             if items:
                 break
+
         if len(driver.window_handles) > 1:
             driver.close()
             driver.switch_to.window(driver.window_handles[0])
+
     except Exception:
         try:
             if len(driver.window_handles) > 1:
@@ -318,18 +382,29 @@ def run_efris_enrichment(purchases_df, log_placeholder, progress_bar):
     for col in ["Quantity", "Unit Measure", "Unit Price"]:
         if col not in purchases_df.columns:
             purchases_df[col] = None
-    total  = len(purchases_df)
+
+    total     = len(purchases_df)
     log_lines = []
+
     def log(msg):
         log_lines.append(msg)
         log_placeholder.markdown(
             '<div class="log-box">' + "<br>".join(log_lines[-60:]) + "</div>",
             unsafe_allow_html=True)
+
+    # ── Diagnostic: show what binaries are available ──────────────────────────
+    for p in ["/usr/bin/chromium-browser", "/usr/bin/chromium",
+              "/usr/lib/chromium-browser/chromedriver", "/usr/bin/chromedriver"]:
+        log(f"{'✅' if os.path.exists(p) else '❌'}  {p}")
+
+    log("🚀  Starting browser...")
     try:
         driver = _get_chrome_driver()
+        log("✅  Browser started successfully")
     except Exception as e:
-        st.error(f"Could not start browser: {e}\n\nEnsure packages.txt has chromium-browser and chromium-chromedriver.")
+        st.error(str(e))
         return purchases_df
+
     fdn_cache = {}
     try:
         for idx, row in purchases_df.iterrows():
@@ -337,9 +412,11 @@ def run_efris_enrichment(purchases_df, log_placeholder, progress_bar):
             desc = str(row.get("Description of Goods", "")).strip()
             row_num = idx + 2
             progress_bar.progress((idx + 1) / total, text=f"Row {idx+1}/{total} — FDN: {fdn}")
+
             if not fdn or fdn.lower() == "nan":
                 log(f"[Row {row_num}] ⚠️  Skipped — no FDN")
                 continue
+
             if fdn not in fdn_cache:
                 log(f"[Row {row_num}] 🔍  Validating FDN: {fdn}  |  Product: {desc}")
                 try:
@@ -349,29 +426,34 @@ def run_efris_enrichment(purchases_df, log_placeholder, progress_bar):
                     fdn_cache[fdn] = []
                     log(f"[Row {row_num}] ❌  Error: {e}")
             else:
-                log(f"[Row {row_num}] 📋  Cached FDN: {fdn}")
+                log(f"[Row {row_num}] 📋  Cached — FDN: {fdn}")
+
             invoice_items = fdn_cache[fdn]
             if not invoice_items:
                 log(f"[Row {row_num}] ⚠️  No items for FDN: {fdn}")
                 continue
+
             invoice_names = [i["item"] for i in invoice_items]
             matched_name  = fuzzy_match_product(desc, invoice_names)
             if matched_name:
-                hit = next((i for i in invoice_items if i["item"].strip().upper() == matched_name.strip().upper()), None)
+                hit = next((i for i in invoice_items
+                            if i["item"].strip().upper() == matched_name.strip().upper()), None)
                 if hit:
                     purchases_df.at[idx, "Quantity"]     = hit["quantity"]
                     purchases_df.at[idx, "Unit Measure"] = hit["unit_measure"]
                     purchases_df.at[idx, "Unit Price"]   = hit["unit_price"]
-                    log(f"[Row {row_num}] ✔️  '{desc}' → '{matched_name}' | Qty:{hit['quantity']} Unit:{hit['unit_measure']} Price:{hit['unit_price']}")
+                    log(f"[Row {row_num}] ✔️  '{desc}' → '{matched_name}' | "
+                        f"Qty:{hit['quantity']}  Unit:{hit['unit_measure']}  Price:{hit['unit_price']}")
                 else:
                     log(f"[Row {row_num}] ⚠️  Lookup failed: {matched_name}")
             else:
-                log(f"[Row {row_num}] ⚠️  No match for '{desc}' in: {invoice_names}")
+                log(f"[Row {row_num}] ⚠️  No match for '{desc}' among: {invoice_names}")
     finally:
         try:
             driver.quit()
         except Exception:
             pass
+
     log("🏁  All rows processed.")
     return purchases_df
 
