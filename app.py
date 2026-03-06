@@ -210,6 +210,7 @@ def _get_driver():
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
+    import shutil, glob
 
     options = Options()
     options.add_argument("--headless=new")
@@ -221,24 +222,54 @@ def _get_driver():
     options.add_argument("--single-process")
     options.add_argument("--no-zygote")
 
-    # Read paths set in Dockerfile ENV
-    browser_path  = os.environ.get("CHROMIUM_PATH",    "/usr/bin/chromium")
-    driver_path   = os.environ.get("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
+    # ── Locate browser binary ─────────────────────────────────────────────────
+    # python:3.11-slim (Debian bookworm) puts chromium at /usr/bin/chromium
+    BROWSER_CANDIDATES = [
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+    ]
+    # ── Locate chromedriver ───────────────────────────────────────────────────
+    # chromium-driver package puts chromedriver at /usr/bin/chromedriver
+    DRIVER_CANDIDATES = [
+        "/usr/bin/chromedriver",
+        "/usr/lib/chromium/chromedriver",
+        "/usr/lib/chromium-browser/chromedriver",
+    ]
 
-    # Fallback candidates in case ENV vars differ
-    for bp in [browser_path, "/usr/bin/chromium", "/usr/bin/chromium-browser",
-               "/usr/bin/google-chrome"]:
-        if os.path.exists(bp):
-            options.binary_location = bp
-            break
+    browser_path = next((p for p in BROWSER_CANDIDATES if os.path.exists(p)), None)
+    driver_path  = next((p for p in DRIVER_CANDIDATES  if os.path.exists(p)), None)
 
-    for dp in [driver_path, "/usr/bin/chromedriver",
-               "/usr/lib/chromium/chromedriver",
-               "/usr/lib/chromium-browser/chromedriver"]:
-        if os.path.exists(dp):
-            return webdriver.Chrome(service=Service(executable_path=dp), options=options)
+    # If still not found, do a full filesystem search (slow but sure)
+    if not browser_path:
+        hits = glob.glob("/usr/**/chromium", recursive=True)
+        browser_path = next((h for h in hits if os.access(h, os.X_OK)), None)
+    if not driver_path:
+        hits = glob.glob("/usr/**/chromedriver", recursive=True)
+        driver_path = next((h for h in hits if os.access(h, os.X_OK)), None)
 
-    raise RuntimeError("chromedriver not found. Make sure the Dockerfile installed chromium-driver.")
+    # Log findings — visible in Railway runtime logs
+    print(f"[CHROMIUM   ] {browser_path or 'NOT FOUND'}")
+    print(f"[CHROMEDRIVER] {driver_path  or 'NOT FOUND'}")
+
+    if browser_path:
+        options.binary_location = browser_path
+
+    if driver_path:
+        return webdriver.Chrome(
+            service=Service(executable_path=driver_path),
+            options=options
+        )
+
+    # Absolute last resort — let selenium resolve from PATH
+    try:
+        return webdriver.Chrome(options=options)
+    except Exception as e:
+        raise RuntimeError(
+            f"Chromium={browser_path}  ChromeDriver={driver_path}\n"
+            f"Neither binary found. Build log should show installed paths.\n{e}"
+        )
 
 
 def _parse_pdf_bytes(pdf_bytes: bytes) -> list[dict]:
@@ -470,9 +501,11 @@ def run_efris_enrichment(purchases_df, log_placeholder, progress_bar):
             '<div class="log-box">' + "<br>".join(log_lines[-60:]) + "</div>",
             unsafe_allow_html=True)
 
-    # Show binary status
-    for p in ["/usr/bin/chromium", "/usr/bin/chromedriver"]:
-        log(f"{'✅' if os.path.exists(p) else '❌'}  {p}")
+    # Show binary status — search PATH and common locations
+    import shutil
+    for name in ["chromium", "chromium-browser", "chromedriver", "chromium-driver"]:
+        p = shutil.which(name)
+        log(f"{'✅' if p else '❌'}  {name} → {p or 'not found'}")
 
     log("🚀  Starting browser...")
     try:
