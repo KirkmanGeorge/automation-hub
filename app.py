@@ -241,16 +241,102 @@ def _get_driver():
     raise RuntimeError("chromedriver not found. Make sure the Dockerfile installed chromium-driver.")
 
 
+def _parse_pdf_bytes(pdf_bytes: bytes) -> list[dict]:
+    """
+    Parse the EFRIS invoice PDF and extract all line items from Section D.
+    Returns list of dicts with item, quantity, unit_measure, unit_price.
+    """
+    import pdfplumber
+    import io, re
+    items = []
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                # Try structured table extraction first
+                tables = page.extract_tables()
+                for table in tables:
+                    if not table:
+                        continue
+                    # Find header row
+                    header_idx = None
+                    col_map = {}
+                    for i, row in enumerate(table):
+                        if not row:
+                            continue
+                        upper = [str(c or "").upper().strip() for c in row]
+                        if "ITEM" in upper and "QUANTITY" in upper:
+                            header_idx = i
+                            for j, h in enumerate(upper):
+                                if h == "ITEM":                       col_map["item"]         = j
+                                elif h == "QUANTITY":                 col_map["quantity"]     = j
+                                elif "UNIT" in h and "MEASURE" in h: col_map["unit_measure"] = j
+                                elif "UNIT" in h and "PRICE" in h:   col_map["unit_price"]   = j
+                            continue
+                        if header_idx is not None:
+                            def _g(key, fb):
+                                ix = col_map.get(key, fb)
+                                return str(row[ix] or "").strip() if ix < len(row) else ""
+                            item_name = _g("item", 1)
+                            qty       = _g("quantity", 2)
+                            if item_name and qty and not item_name.upper().startswith("TAX"):
+                                items.append({
+                                    "item":         item_name,
+                                    "quantity":     qty,
+                                    "unit_measure": _g("unit_measure", 3),
+                                    "unit_price":   _g("unit_price", 4),
+                                })
+                    if items:
+                        return items
+
+                # Fallback: raw text parsing if table extraction found nothing
+                if not items:
+                    text = page.extract_text() or ""
+                    lines = text.split("\n")
+                    in_section_d = False
+                    for line in lines:
+                        line = line.strip()
+                        if "Section D" in line or "Goods & Services" in line:
+                            in_section_d = True
+                            continue
+                        if "Section E" in line or "Tax Details" in line:
+                            break
+                        if not in_section_d:
+                            continue
+                        # Match lines like: "1. Red Oxide GL - 4Ltr 10 TN-Tin 39,000 390,000 A"
+                        m = re.match(
+                            r"\d+\.?\s+(.+?)\s+(\d+)\s+(\S+(?:-\S+)?)\s+([\d,]+)\s+[\d,]+\s+[A-Z]",
+                            line
+                        )
+                        if m:
+                            items.append({
+                                "item":         m.group(1).strip(),
+                                "quantity":     m.group(2).strip(),
+                                "unit_measure": m.group(3).strip(),
+                                "unit_price":   m.group(4).strip(),
+                            })
+    except Exception as e:
+        pass
+    return items
+
+
 def _scrape_fdn(driver, fdn):
+    """
+    1. Navigate to EFRIS, paste FDN, validate, click View Document.
+    2. The invoice opens as a PDF in a new tab — grab that URL.
+    3. Download the PDF with requests and parse it with pdfplumber.
+    """
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
+    import requests as _req
     items = []
+    original_handle = driver.current_window_handle
+
     try:
         driver.get("https://efris.ura.go.ug/")
         wait = WebDriverWait(driver, 20)
 
-        # Paste FDN into the validation box
+        # Paste FDN
         fdn_input = wait.until(EC.presence_of_element_located((By.XPATH,
             "//input[contains(@placeholder,'Fiscal Document') or "
             "contains(@placeholder,'fiscal') or contains(@placeholder,'FDN')]")))
@@ -265,10 +351,13 @@ def _scrape_fdn(driver, fdn):
         validate_btn.click()
         time.sleep(3)
 
-        # Wait for popup
+        # Wait for verified popup
         wait.until(EC.presence_of_element_located((By.XPATH,
             "//*[contains(text(),'erified') or contains(text(),'Validation Report')]")))
         time.sleep(1)
+
+        # Note existing handles before clicking View Document
+        handles_before = set(driver.window_handles)
 
         # Click View Document
         view_btn = wait.until(EC.element_to_be_clickable((By.XPATH,
@@ -277,52 +366,87 @@ def _scrape_fdn(driver, fdn):
         view_btn.click()
         time.sleep(4)
 
-        # Switch to new tab if opened
-        if len(driver.window_handles) > 1:
-            driver.switch_to.window(driver.window_handles[-1])
+        # ── Get the PDF URL ───────────────────────────────────────────────────
+        pdf_url  = None
+        pdf_bytes = None
+
+        # Case 1: a new tab opened — the URL in that tab IS the PDF
+        new_handles = set(driver.window_handles) - handles_before
+        if new_handles:
+            driver.switch_to.window(new_handles.pop())
             time.sleep(2)
-
-        # Scrape invoice table
-        for table in driver.find_elements(By.TAG_NAME, "table"):
-            rows = table.find_elements(By.TAG_NAME, "tr")
-            header_idx, col_map = None, {}
-            for i, row in enumerate(rows):
-                cells = row.find_elements(By.XPATH, ".//td | .//th")
-                texts = [c.text.strip() for c in cells]
-                upper = [t.upper() for t in texts]
-                if header_idx is None:
-                    if "ITEM" in upper and "QUANTITY" in upper:
-                        header_idx = i
-                        for j, h in enumerate(upper):
-                            if h == "ITEM":                       col_map["item"]         = j
-                            elif h == "QUANTITY":                 col_map["quantity"]     = j
-                            elif "UNIT" in h and "MEASURE" in h: col_map["unit_measure"] = j
-                            elif "UNIT" in h and "PRICE" in h:   col_map["unit_price"]   = j
-                        continue
-                if header_idx is not None and texts:
-                    def _g(key, fb):
-                        ix = col_map.get(key, fb)
-                        return texts[ix] if ix < len(texts) else ""
-                    item_name = _g("item", 1)
-                    qty       = _g("quantity", 2)
-                    if item_name and qty:
-                        items.append({"item": item_name, "quantity": qty,
-                                      "unit_measure": _g("unit_measure", 3),
-                                      "unit_price":   _g("unit_price", 4)})
-            if items:
-                break
-
-        if len(driver.window_handles) > 1:
+            pdf_url = driver.current_url
             driver.close()
-            driver.switch_to.window(driver.window_handles[0])
+            driver.switch_to.window(original_handle)
 
+        # Case 2: same tab navigated to PDF
+        elif driver.current_url != "https://efris.ura.go.ug/" and (
+                "pdf" in driver.current_url.lower() or
+                driver.current_url != driver.current_url):
+            pdf_url = driver.current_url
+            driver.get("https://efris.ura.go.ug/")
+
+        # Case 3: look for an <embed>/<iframe>/<object> src pointing to pdf
+        if not pdf_url:
+            for tag in ["embed", "iframe", "object"]:
+                els = driver.find_elements(By.TAG_NAME, tag)
+                for el in els:
+                    src = el.get_attribute("src") or el.get_attribute("data") or ""
+                    if src:
+                        pdf_url = src
+                        break
+                if pdf_url:
+                    break
+
+        # Case 4: look for any <a> link ending in .pdf
+        if not pdf_url:
+            links = driver.find_elements(By.XPATH, "//a[contains(@href,'.pdf')]")
+            if links:
+                pdf_url = links[0].get_attribute("href")
+
+        # ── Download & parse the PDF ──────────────────────────────────────────
+        if pdf_url and pdf_url.startswith("http"):
+            # Reuse browser cookies so the authenticated PDF download works
+            cookies = {c["name"]: c["value"] for c in driver.get_cookies()}
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/120.0.0.0 Safari/537.36",
+                "Referer": "https://efris.ura.go.ug/",
+            }
+            resp = _req.get(pdf_url, cookies=cookies, headers=headers, timeout=30)
+            if resp.status_code == 200 and resp.content:
+                pdf_bytes = resp.content
+
+        # ── Fallback: try to find PDF blob URL via page source ────────────────
+        if not pdf_bytes:
+            import re
+            src = driver.page_source
+            blob_matches = re.findall(r'blob:https?://[^"\']+', src)
+            pdf_matches  = re.findall(r'https?://[^"\']+\.pdf[^"\']*', src)
+            for url in (blob_matches + pdf_matches):
+                try:
+                    cookies = {c["name"]: c["value"] for c in driver.get_cookies()}
+                    resp = _req.get(url, cookies=cookies, timeout=20)
+                    if resp.status_code == 200 and len(resp.content) > 1000:
+                        pdf_bytes = resp.content
+                        break
+                except Exception:
+                    continue
+
+        if pdf_bytes:
+            items = _parse_pdf_bytes(pdf_bytes)
+
+    except Exception as e:
+        pass
+
+    # Always return to original tab cleanly
+    try:
+        if driver.current_window_handle != original_handle:
+            driver.switch_to.window(original_handle)
     except Exception:
-        try:
-            if len(driver.window_handles) > 1:
-                driver.close()
-                driver.switch_to.window(driver.window_handles[0])
-        except Exception:
-            pass
+        pass
+
     return items
 
 
