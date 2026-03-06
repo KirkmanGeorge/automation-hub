@@ -276,12 +276,13 @@ def _get_driver():
     options.add_argument("--disable-setuid-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1280,900")
+    options.add_argument("--window-size=1920,1080")
     options.add_argument("--no-zygote")
-    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--single-process")
     options.add_argument("--disable-extensions")
-    options.add_argument("--disable-background-networking")
-    options.add_argument("--remote-debugging-port=0")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--disable-features=VizDisplayCompositor")
+    options.add_argument("--shm-size=1gb")
     # Enable performance/network logging so we can capture PDF URL
     options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
 
