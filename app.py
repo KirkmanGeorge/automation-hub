@@ -276,40 +276,45 @@ def _get_driver():
     options.add_argument("--disable-setuid-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
+    options.add_argument("--disable-gpu-sandbox")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--no-zygote")
-    options.add_argument("--single-process")
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-software-rasterizer")
     options.add_argument("--disable-features=VizDisplayCompositor")
-    options.add_argument("--shm-size=1gb")
-    # Enable performance/network logging so we can capture PDF URL
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-backgrounding-occluded-windows")
+    options.add_argument("--disable-renderer-backgrounding")
+    # Enable network logging to capture PDF URL
     options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
 
+    # Google Chrome stable installed via Dockerfile from Google's repo
+    # Falls back to chromium if Chrome not found
     browser_candidates = [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
         "/usr/lib/chromium/chromium",
         "/usr/bin/chromium",
         "/usr/bin/chromium-browser",
     ]
     driver_candidates = [
-        "/usr/lib/chromium/chromedriver",
         "/usr/bin/chromedriver",
-        "/usr/lib/chromium-browser/chromedriver",
+        "/usr/local/bin/chromedriver",
+        "/usr/lib/chromium/chromedriver",
     ]
-
-    # Also glob-search under /usr in case paths differ
-    if not any(os.path.exists(p) for p in browser_candidates):
-        hits = glob.glob("/usr/**/chromium", recursive=True)
-        browser_candidates = [h for h in hits if os.access(h, os.X_OK)] + browser_candidates
-
-    if not any(os.path.exists(p) for p in driver_candidates):
-        hits = glob.glob("/usr/**/chromedriver", recursive=True)
-        driver_candidates = [h for h in hits if os.access(h, os.X_OK)] + driver_candidates
 
     browser = next((p for p in browser_candidates if os.path.exists(p)), None)
     driver_bin = next((p for p in driver_candidates if os.path.exists(p)), None)
 
-    print(f"[CHROMIUM]    {browser}")
+    # If still not found, search
+    if not browser:
+        hits = glob.glob("/usr/**/chrome", recursive=True) + glob.glob("/usr/**/chromium", recursive=True)
+        browser = next((h for h in hits if os.access(h, os.X_OK)), None)
+    if not driver_bin:
+        hits = glob.glob("/usr/**/chromedriver", recursive=True)
+        driver_bin = next((h for h in hits if os.access(h, os.X_OK)), None)
+
+    print(f"[BROWSER]      {browser}")
     print(f"[CHROMEDRIVER] {driver_bin}")
 
     if browser:
