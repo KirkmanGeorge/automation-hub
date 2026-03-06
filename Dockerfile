@@ -1,7 +1,5 @@
-# Full Debian image — gives us apt-get with root access
 FROM python:3.11-slim
 
-# Install Chromium + ChromeDriver + all system libraries in one shot
 RUN apt-get update && apt-get install -y \
     chromium \
     chromium-driver \
@@ -29,26 +27,21 @@ RUN apt-get update && apt-get install -y \
     wget \
     poppler-utils \
     --no-install-recommends && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* && \
+    echo ">>> CHROMIUM:" && which chromium || which chromium-browser || true && \
+    echo ">>> CHROMEDRIVER:" && which chromedriver || true && \
+    ls -la /usr/bin/chrom* 2>/dev/null || true && \
+    ls -la /usr/lib/chromium* 2>/dev/null || true
 
-# Set environment variables so Selenium finds Chromium
-ENV CHROMIUM_PATH=/usr/bin/chromium
-ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
-
-# Set working directory
 WORKDIR /app
 
-# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app
 COPY app.py .
 
-# Expose port Railway expects
 EXPOSE 8501
 
-# Run Streamlit
 CMD ["streamlit", "run", "app.py", \
      "--server.port=8501", \
      "--server.address=0.0.0.0", \
