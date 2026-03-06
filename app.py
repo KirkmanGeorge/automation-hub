@@ -1,9 +1,9 @@
-import os, time
+import os, time, re, glob
 import streamlit as st
 import openpyxl
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 import random
 from io import BytesIO
 import difflib
@@ -15,17 +15,8 @@ st.markdown("""
     .stButton > button {
         background-color: #0078D4; color: white; border-radius: 4px;
         border: none; padding: 8px 16px; font-weight: 500;
-        transition: background-color 0.3s ease;
     }
     .stButton > button:hover { background-color: #106EBE; }
-    .stExpander, .stMarkdown {
-        background-color: white; border-radius: 8px;
-        box-shadow: 0 1.6px 3.6px rgba(0,0,0,0.1);
-        padding: 16px; margin-bottom: 16px;
-    }
-    .stFileUploader { border: 1px solid #D3D3D3; border-radius: 4px; padding: 8px; }
-    section[data-testid="stSidebar"] { background-color: #FFFFFF; }
-    .stTextInput > div > div > input { border-radius: 4px; border: 1px solid #D3D3D3; padding: 8px; }
     p, li, span, div { color: #000000 !important; }
     .log-box {
         background: #1e1e1e; color: #00ff88; font-family: monospace;
@@ -38,7 +29,7 @@ st.markdown("""
 st.set_page_config(page_title="Automation Hub", layout="wide", page_icon="🤖")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EXISTING TOOL: Excel Stock Movement Filler  (UNCHANGED)
+# TOOL 1: Excel Stock Movement Filler  (UNCHANGED)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def normalize_name(name):
@@ -203,95 +194,19 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NEW TOOL: EFRIS Invoice Enricher — Selenium + Chromium (installed via Dockerfile)
+# TOOL 2: EFRIS Invoice Enricher
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _get_driver():
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.chrome.service import Service
-    import shutil, glob
-
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1280,900")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--single-process")
-    options.add_argument("--no-zygote")
-
-    # ── Locate browser binary ─────────────────────────────────────────────────
-    # On Debian bookworm (python:3.11-slim), chromium-driver installs to
-    # /usr/lib/chromium/ — NOT /usr/bin/
-    BROWSER_CANDIDATES = [
-        "/usr/lib/chromium/chromium",           # Debian bookworm primary
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/lib/chromium-browser/chromium-browser",
-        "/usr/bin/google-chrome",
-    ]
-    # ── Locate chromedriver ───────────────────────────────────────────────────
-    DRIVER_CANDIDATES = [
-        "/usr/lib/chromium/chromedriver",       # Debian bookworm primary
-        "/usr/bin/chromedriver",
-        "/usr/lib/chromium-browser/chromedriver",
-    ]
-
-    browser_path = next((p for p in BROWSER_CANDIDATES if os.path.exists(p)), None)
-    driver_path  = next((p for p in DRIVER_CANDIDATES  if os.path.exists(p)), None)
-
-    # If still not found, do a full filesystem search (slow but sure)
-    if not browser_path:
-        hits = glob.glob("/usr/**/chromium", recursive=True)
-        browser_path = next((h for h in hits if os.access(h, os.X_OK)), None)
-    if not driver_path:
-        hits = glob.glob("/usr/**/chromedriver", recursive=True)
-        driver_path = next((h for h in hits if os.access(h, os.X_OK)), None)
-
-    # Log findings — visible in Railway runtime logs
-    print(f"[CHROMIUM   ] {browser_path or 'NOT FOUND'}")
-    print(f"[CHROMEDRIVER] {driver_path  or 'NOT FOUND'}")
-
-    if browser_path:
-        options.binary_location = browser_path
-
-    if driver_path:
-        return webdriver.Chrome(
-            service=Service(executable_path=driver_path),
-            options=options
-        )
-
-    # Absolute last resort — let selenium resolve from PATH
-    try:
-        return webdriver.Chrome(options=options)
-    except Exception as e:
-        raise RuntimeError(
-            f"Chromium={browser_path}  ChromeDriver={driver_path}\n"
-            f"Neither binary found. Build log should show installed paths.\n{e}"
-        )
-
-
-def _parse_pdf_bytes(pdf_bytes: bytes) -> list[dict]:
-    """
-    Parse the EFRIS invoice PDF and extract all line items from Section D.
-    Returns list of dicts with item, quantity, unit_measure, unit_price.
-    """
-    import pdfplumber
-    import io, re
+def _parse_pdf_bytes(pdf_bytes):
+    """Extract Section D line items from EFRIS invoice PDF bytes."""
+    import pdfplumber, io
     items = []
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page in pdf.pages:
-                # Try structured table extraction first
-                tables = page.extract_tables()
-                for table in tables:
-                    if not table:
-                        continue
-                    # Find header row
-                    header_idx = None
-                    col_map = {}
+                # Try table extraction first
+                for table in (page.extract_tables() or []):
+                    header_idx, col_map = None, {}
                     for i, row in enumerate(table):
                         if not row:
                             continue
@@ -305,174 +220,262 @@ def _parse_pdf_bytes(pdf_bytes: bytes) -> list[dict]:
                                 elif "UNIT" in h and "PRICE" in h:   col_map["unit_price"]   = j
                             continue
                         if header_idx is not None:
-                            def _g(key, fb):
+                            def g(key, fb, row=row):
                                 ix = col_map.get(key, fb)
                                 return str(row[ix] or "").strip() if ix < len(row) else ""
-                            item_name = _g("item", 1)
-                            qty       = _g("quantity", 2)
+                            item_name = g("item", 1)
+                            qty = g("quantity", 2)
                             if item_name and qty and not item_name.upper().startswith("TAX"):
                                 items.append({
-                                    "item":         item_name,
-                                    "quantity":     qty,
-                                    "unit_measure": _g("unit_measure", 3),
-                                    "unit_price":   _g("unit_price", 4),
+                                    "item": item_name,
+                                    "quantity": qty,
+                                    "unit_measure": g("unit_measure", 3),
+                                    "unit_price": g("unit_price", 4),
                                 })
                     if items:
                         return items
 
-                # Fallback: raw text parsing if table extraction found nothing
-                if not items:
-                    text = page.extract_text() or ""
-                    lines = text.split("\n")
-                    in_section_d = False
-                    for line in lines:
-                        line = line.strip()
-                        if "Section D" in line or "Goods & Services" in line:
-                            in_section_d = True
-                            continue
-                        if "Section E" in line or "Tax Details" in line:
-                            break
-                        if not in_section_d:
-                            continue
-                        # Match lines like: "1. Red Oxide GL - 4Ltr 10 TN-Tin 39,000 390,000 A"
-                        m = re.match(
-                            r"\d+\.?\s+(.+?)\s+(\d+)\s+(\S+(?:-\S+)?)\s+([\d,]+)\s+[\d,]+\s+[A-Z]",
-                            line
-                        )
-                        if m:
-                            items.append({
-                                "item":         m.group(1).strip(),
-                                "quantity":     m.group(2).strip(),
-                                "unit_measure": m.group(3).strip(),
-                                "unit_price":   m.group(4).strip(),
-                            })
+                # Fallback: raw text line-by-line
+                text = page.extract_text() or ""
+                in_d = False
+                for line in text.split("\n"):
+                    line = line.strip()
+                    if "Section D" in line or "Goods & Services" in line:
+                        in_d = True
+                        continue
+                    if "Section E" in line or "Tax Details" in line:
+                        break
+                    if not in_d:
+                        continue
+                    # e.g. "1. Red Oxide GL - 4Ltr 10 TN-Tin 39,000 390,000 A"
+                    m = re.match(
+                        r"\d+\.?\s+(.+?)\s+(\d[\d,]*)\s+(\S[\S\-]*)\s+([\d,]+)\s+[\d,]+",
+                        line
+                    )
+                    if m:
+                        items.append({
+                            "item": m.group(1).strip(),
+                            "quantity": m.group(2).strip(),
+                            "unit_measure": m.group(3).strip(),
+                            "unit_price": m.group(4).strip(),
+                        })
     except Exception as e:
-        pass
+        print(f"[PDF PARSE ERROR] {e}")
     return items
 
 
-def _scrape_fdn(driver, fdn):
+def _get_driver():
+    """Build a Selenium Chrome driver using system Chromium installed via Dockerfile."""
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1280,900")
+    options.add_argument("--single-process")
+    options.add_argument("--no-zygote")
+    # Enable performance/network logging so we can capture PDF URL
+    options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+
+    browser_candidates = [
+        "/usr/lib/chromium/chromium",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+    ]
+    driver_candidates = [
+        "/usr/lib/chromium/chromedriver",
+        "/usr/bin/chromedriver",
+        "/usr/lib/chromium-browser/chromedriver",
+    ]
+
+    # Also glob-search under /usr in case paths differ
+    if not any(os.path.exists(p) for p in browser_candidates):
+        hits = glob.glob("/usr/**/chromium", recursive=True)
+        browser_candidates = [h for h in hits if os.access(h, os.X_OK)] + browser_candidates
+
+    if not any(os.path.exists(p) for p in driver_candidates):
+        hits = glob.glob("/usr/**/chromedriver", recursive=True)
+        driver_candidates = [h for h in hits if os.access(h, os.X_OK)] + driver_candidates
+
+    browser = next((p for p in browser_candidates if os.path.exists(p)), None)
+    driver_bin = next((p for p in driver_candidates if os.path.exists(p)), None)
+
+    print(f"[CHROMIUM]    {browser}")
+    print(f"[CHROMEDRIVER] {driver_bin}")
+
+    if browser:
+        options.binary_location = browser
+    if driver_bin:
+        return webdriver.Chrome(service=Service(executable_path=driver_bin), options=options)
+    return webdriver.Chrome(options=options)
+
+
+def _scrape_fdn(driver, fdn, log_fn=None):
     """
-    1. Navigate to EFRIS, paste FDN, validate, click View Document.
-    2. The invoice opens as a PDF in a new tab — grab that URL.
-    3. Download the PDF with requests and parse it with pdfplumber.
+    Validate FDN on EFRIS, capture the invoice PDF via CDP network logs,
+    download it and parse with pdfplumber.
     """
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
-    import requests as _req
+    import requests as req_lib, json
+
+    def dbg(msg):
+        print(msg)
+        if log_fn:
+            log_fn(msg)
+
     items = []
     original_handle = driver.current_window_handle
 
     try:
         driver.get("https://efris.ura.go.ug/")
         wait = WebDriverWait(driver, 20)
+        dbg("  [1] Loaded EFRIS")
 
-        # Paste FDN
-        fdn_input = wait.until(EC.presence_of_element_located((By.XPATH,
-            "//input[contains(@placeholder,'Fiscal Document') or "
-            "contains(@placeholder,'fiscal') or contains(@placeholder,'FDN')]")))
-        fdn_input.clear()
-        fdn_input.send_keys(str(fdn))
+        # Type FDN
+        inp = wait.until(EC.presence_of_element_located((By.XPATH,
+            "//input[@placeholder and ("
+            "contains(translate(@placeholder,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'fiscal')"
+            " or contains(translate(@placeholder,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'fdn')"
+            ")]"
+        )))
+        inp.clear()
+        inp.send_keys(str(fdn))
         time.sleep(0.4)
+        dbg("  [2] FDN typed")
 
         # Click Validate
-        validate_btn = wait.until(EC.element_to_be_clickable((By.XPATH,
-            "//button[contains(translate(.,'abcdefghijklmnopqrstuvwxyz',"
-            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'VALIDATE')]")))
-        validate_btn.click()
+        btn = wait.until(EC.element_to_be_clickable((By.XPATH,
+            "//button[contains(translate(normalize-space(.),"
+            "'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'VALIDATE')]"
+        )))
+        btn.click()
         time.sleep(3)
+        dbg("  [3] Validated")
 
-        # Wait for verified popup
+        # Wait for verification
         wait.until(EC.presence_of_element_located((By.XPATH,
-            "//*[contains(text(),'erified') or contains(text(),'Validation Report')]")))
+            "//*[contains(text(),'erified') or contains(text(),'Validation')]"
+        )))
         time.sleep(1)
+        dbg("  [4] Invoice verified")
 
-        # Note existing handles before clicking View Document
         handles_before = set(driver.window_handles)
 
         # Click View Document
-        view_btn = wait.until(EC.element_to_be_clickable((By.XPATH,
-            "//button[contains(translate(.,'abcdefghijklmnopqrstuvwxyz',"
-            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'VIEW DOCUMENT')]")))
-        view_btn.click()
-        time.sleep(4)
+        vbtn = wait.until(EC.element_to_be_clickable((By.XPATH,
+            "//button[contains(translate(normalize-space(.),"
+            "'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'VIEW DOCUMENT')]"
+        )))
+        vbtn.click()
+        time.sleep(5)
+        dbg("  [5] View Document clicked")
 
-        # ── Get the PDF URL ───────────────────────────────────────────────────
-        pdf_url  = None
-        pdf_bytes = None
+        # ── Strategy 1: capture PDF URL from CDP performance logs ─────────────
+        pdf_url = None
+        try:
+            logs = driver.get_log("performance")
+            for entry in logs:
+                msg = json.loads(entry["message"])["message"]
+                if msg.get("method") == "Network.responseReceived":
+                    url = msg.get("params", {}).get("response", {}).get("url", "")
+                    mime = msg.get("params", {}).get("response", {}).get("mimeType", "")
+                    if "pdf" in mime.lower() or (url and ".pdf" in url.lower()):
+                        pdf_url = url
+                        dbg(f"  [6-CDP] PDF URL: {pdf_url}")
+                        break
+        except Exception as e:
+            dbg(f"  [6-CDP] Log error: {e}")
 
-        # Case 1: a new tab opened — the URL in that tab IS the PDF
-        new_handles = set(driver.window_handles) - handles_before
-        if new_handles:
-            driver.switch_to.window(new_handles.pop())
-            time.sleep(2)
-            pdf_url = driver.current_url
-            driver.close()
-            driver.switch_to.window(original_handle)
-
-        # Case 2: same tab navigated to PDF
-        elif driver.current_url != "https://efris.ura.go.ug/" and (
-                "pdf" in driver.current_url.lower() or
-                driver.current_url != driver.current_url):
-            pdf_url = driver.current_url
-            driver.get("https://efris.ura.go.ug/")
-
-        # Case 3: look for an <embed>/<iframe>/<object> src pointing to pdf
+        # ── Strategy 2: new tab URL ───────────────────────────────────────────
         if not pdf_url:
-            for tag in ["embed", "iframe", "object"]:
-                els = driver.find_elements(By.TAG_NAME, tag)
-                for el in els:
-                    src = el.get_attribute("src") or el.get_attribute("data") or ""
-                    if src:
-                        pdf_url = src
+            new_handles = set(driver.window_handles) - handles_before
+            if new_handles:
+                driver.switch_to.window(list(new_handles)[0])
+                time.sleep(2)
+                pdf_url = driver.current_url
+                dbg(f"  [6-TAB] New tab URL: {pdf_url}")
+                driver.close()
+                driver.switch_to.window(original_handle)
+            else:
+                cur = driver.current_url
+                dbg(f"  [6-SAME] Same tab URL: {cur}")
+                if "efris.ura.go.ug" in cur and cur != "https://efris.ura.go.ug/":
+                    pdf_url = cur
+
+        # ── Strategy 3: scan page source for any URL with pdf/invoice ─────────
+        if not pdf_url:
+            src = driver.page_source
+            # Find all http URLs in the page
+            all_urls = re.findall(r'https?://[^\s"\'<>\\]+', src)
+            for u in all_urls:
+                if ".pdf" in u.lower() or "printInvoice" in u or "viewDoc" in u:
+                    pdf_url = u
+                    dbg(f"  [6-SRC] Found in source: {pdf_url}")
+                    break
+
+        # ── Strategy 4: check embedded elements ──────────────────────────────
+        if not pdf_url:
+            for tag in ["embed", "iframe", "object", "a"]:
+                for el in driver.find_elements(By.TAG_NAME, tag):
+                    for attr in ["src", "data", "href"]:
+                        val = el.get_attribute(attr) or ""
+                        if val and ("pdf" in val.lower() or "invoice" in val.lower()):
+                            pdf_url = val
+                            dbg(f"  [6-EL] {tag}.{attr}: {pdf_url}")
+                            break
+                    if pdf_url:
                         break
                 if pdf_url:
                     break
 
-        # Case 4: look for any <a> link ending in .pdf
-        if not pdf_url:
-            links = driver.find_elements(By.XPATH, "//a[contains(@href,'.pdf')]")
-            if links:
-                pdf_url = links[0].get_attribute("href")
+        dbg(f"  [7] Final PDF URL: {pdf_url}")
 
-        # ── Download & parse the PDF ──────────────────────────────────────────
+        # ── Download PDF ──────────────────────────────────────────────────────
+        pdf_bytes = None
         if pdf_url and pdf_url.startswith("http"):
-            # Reuse browser cookies so the authenticated PDF download works
             cookies = {c["name"]: c["value"] for c in driver.get_cookies()}
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                              "AppleWebKit/537.36 (KHTML, like Gecko) "
-                              "Chrome/120.0.0.0 Safari/537.36",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0",
                 "Referer": "https://efris.ura.go.ug/",
             }
-            resp = _req.get(pdf_url, cookies=cookies, headers=headers, timeout=30)
-            if resp.status_code == 200 and resp.content:
-                pdf_bytes = resp.content
+            try:
+                resp = req_lib.get(pdf_url, cookies=cookies, headers=headers, timeout=30)
+                dbg(f"  [8] Download: {resp.status_code}, {len(resp.content)} bytes, type: {resp.headers.get('content-type','?')}")
+                if resp.status_code == 200 and len(resp.content) > 500:
+                    pdf_bytes = resp.content
+            except Exception as e:
+                dbg(f"  [8] Download error: {e}")
+        elif pdf_url and pdf_url.startswith("blob:"):
+            dbg("  [8] Blob URL — extracting via JS")
+            try:
+                js = ("var cb=arguments[arguments.length-1];"
+                      "fetch(arguments[0]).then(r=>r.arrayBuffer())"
+                      ".then(b=>cb(Array.from(new Uint8Array(b))))"
+                      ".catch(e=>cb([]));")
+                arr = driver.execute_async_script(js, pdf_url)
+                if arr:
+                    pdf_bytes = bytes(arr)
+                    dbg(f"  [8] Blob: {len(pdf_bytes)} bytes")
+            except Exception as e:
+                dbg(f"  [8] Blob error: {e}")
 
-        # ── Fallback: try to find PDF blob URL via page source ────────────────
-        if not pdf_bytes:
-            import re
-            src = driver.page_source
-            blob_matches = re.findall(r'blob:https?://[^"\']+', src)
-            pdf_matches  = re.findall(r'https?://[^"\']+\.pdf[^"\']*', src)
-            for url in (blob_matches + pdf_matches):
-                try:
-                    cookies = {c["name"]: c["value"] for c in driver.get_cookies()}
-                    resp = _req.get(url, cookies=cookies, timeout=20)
-                    if resp.status_code == 200 and len(resp.content) > 1000:
-                        pdf_bytes = resp.content
-                        break
-                except Exception:
-                    continue
-
+        # ── Parse PDF ─────────────────────────────────────────────────────────
         if pdf_bytes:
+            dbg(f"  [9] Parsing PDF ({len(pdf_bytes)} bytes)...")
             items = _parse_pdf_bytes(pdf_bytes)
+            dbg(f"  [9] Parsed {len(items)} items: {[i['item'] for i in items]}")
+        else:
+            dbg("  [9] No PDF bytes captured")
 
     except Exception as e:
-        pass
+        dbg(f"  [ERR] {e}")
 
-    # Always return to original tab cleanly
     try:
         if driver.current_window_handle != original_handle:
             driver.switch_to.window(original_handle)
@@ -482,7 +485,7 @@ def _scrape_fdn(driver, fdn):
     return items
 
 
-def fuzzy_match_product(target, candidates):
+def fuzzy_match(target, candidates):
     t  = target.strip().upper()
     cs = [c.strip().upper() for c in candidates]
     ms = difflib.get_close_matches(t, cs, n=1, cutoff=0.55)
@@ -499,19 +502,20 @@ def run_efris_enrichment(purchases_df, log_placeholder, progress_bar):
     def log(msg):
         log_lines.append(msg)
         log_placeholder.markdown(
-            '<div class="log-box">' + "<br>".join(log_lines[-60:]) + "</div>",
+            '<div class="log-box">' + "<br>".join(log_lines[-80:]) + "</div>",
             unsafe_allow_html=True)
 
-    # Show binary status — search PATH and common locations
+    # Show binary diagnostics
     import shutil
-    for name in ["chromium", "chromium-browser", "chromedriver", "chromium-driver"]:
-        p = shutil.which(name)
+    for name in ["chromium", "chromium-browser", "chromedriver"]:
+        p = shutil.which(name) or next(
+            (c for c in [f"/usr/lib/chromium/{name}", f"/usr/bin/{name}"] if os.path.exists(c)), None)
         log(f"{'✅' if p else '❌'}  {name} → {p or 'not found'}")
 
-    log("🚀  Starting browser...")
+    log("🚀 Starting browser...")
     try:
         driver = _get_driver()
-        log("✅  Browser started!")
+        log("✅ Browser started!")
     except Exception as e:
         st.error(f"Browser failed: {e}")
         return purchases_df
@@ -522,30 +526,29 @@ def run_efris_enrichment(purchases_df, log_placeholder, progress_bar):
             fdn  = str(row.get("FDN", "")).strip()
             desc = str(row.get("Description of Goods", "")).strip()
             row_num = idx + 2
-            progress_bar.progress((idx + 1) / total, text=f"Row {idx+1}/{total} — FDN: {fdn}")
+            progress_bar.progress(min((idx + 1) / total, 1.0), text=f"Row {idx+1}/{total} — {fdn}")
 
             if not fdn or fdn.lower() == "nan":
                 log(f"[Row {row_num}] ⚠️  Skipped — no FDN")
                 continue
 
             if fdn not in fdn_cache:
-                log(f"[Row {row_num}] 🔍  FDN: {fdn}  |  {desc}")
+                log(f"[Row {row_num}] 🔍  FDN: {fdn} | {desc}")
                 try:
-                    fdn_cache[fdn] = _scrape_fdn(driver, fdn)
+                    fdn_cache[fdn] = _scrape_fdn(driver, fdn, log_fn=log)
                     log(f"[Row {row_num}] ✅  {len(fdn_cache[fdn])} item(s) found")
                 except Exception as e:
                     fdn_cache[fdn] = []
                     log(f"[Row {row_num}] ❌  {e}")
             else:
-                log(f"[Row {row_num}] 📋  Cached — FDN: {fdn}")
+                log(f"[Row {row_num}] 📋  Cached — {fdn}")
 
             invoice_items = fdn_cache[fdn]
             if not invoice_items:
-                log(f"[Row {row_num}] ⚠️  No items for FDN: {fdn}")
                 continue
 
             invoice_names = [i["item"] for i in invoice_items]
-            matched = fuzzy_match_product(desc, invoice_names)
+            matched = fuzzy_match(desc, invoice_names)
             if matched:
                 hit = next((i for i in invoice_items
                             if i["item"].strip().upper() == matched.strip().upper()), None)
@@ -553,8 +556,7 @@ def run_efris_enrichment(purchases_df, log_placeholder, progress_bar):
                     purchases_df.at[idx, "Quantity"]     = hit["quantity"]
                     purchases_df.at[idx, "Unit Measure"] = hit["unit_measure"]
                     purchases_df.at[idx, "Unit Price"]   = hit["unit_price"]
-                    log(f"[Row {row_num}] ✔️  '{desc}' → "
-                        f"Qty:{hit['quantity']}  Unit:{hit['unit_measure']}  Price:{hit['unit_price']}")
+                    log(f"[Row {row_num}] ✔️  '{desc}' → Qty:{hit['quantity']} Unit:{hit['unit_measure']} Price:{hit['unit_price']}")
                 else:
                     log(f"[Row {row_num}] ⚠️  Lookup failed: {matched}")
             else:
@@ -565,7 +567,7 @@ def run_efris_enrichment(purchases_df, log_placeholder, progress_bar):
         except Exception:
             pass
 
-    log("🏁  All rows processed.")
+    log("🏁 All rows processed.")
     return purchases_df
 
 
@@ -583,7 +585,7 @@ def build_output_excel(df):
             cell.fill = hdr_fill
             cell.font = Font(bold=True, color="FFFFFF")
             cell.alignment = Alignment(horizontal="center")
-        hi_fill = PatternFill("solid", fgColor="FFF2CC")
+        hi_fill  = PatternFill("solid", fgColor="FFF2CC")
         new_cols = {"Quantity", "Unit Measure", "Unit Price"}
         for i, c in enumerate(ws[1]):
             if c.value in new_cols:
@@ -595,16 +597,16 @@ def build_output_excel(df):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIDEBAR NAVIGATION
+# NAVIGATION
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.sidebar.title("Navigation")
-tool = st.sidebar.selectbox("Select Automation Tool", [
+tool = st.sidebar.selectbox("Select Tool", [
     "Excel Stock Movement Filler",
     "EFRIS Invoice Enricher",
     "Audit Compliance Checker (Coming Soon)",
     "Financial Report Generator (Coming Soon)",
-    "Sales Dashboard (Inspired by Reference)",
+    "Sales Dashboard (Coming Soon)",
 ])
 
 st.title("Automation Hub")
@@ -612,83 +614,70 @@ st.markdown("Your professional platform for automating tasks.")
 
 if tool == "Excel Stock Movement Filler":
     st.header("Excel Stock Movement Filler")
-    output_name   = st.text_input("Output Filename (will add .xlsx)", value="filled_template")
-    output_name   = output_name.removesuffix('.xlsx').strip() + ".xlsx"
+    output_name   = st.text_input("Output Filename", value="filled_template")
+    output_name   = output_name.removesuffix(".xlsx").strip() + ".xlsx"
     template_file = st.file_uploader("Upload Template (.xlsx)", type="xlsx")
     report_file   = st.file_uploader("Upload Movement Report (.xlsx)", type="xlsx")
     damages_file  = st.file_uploader("Upload Damages (.xlsx)", type="xlsx")
     if st.button("Process Files"):
         if template_file and report_file and damages_file:
             with st.spinner("Processing..."):
-                output_bytes = process_excel(template_file, report_file, damages_file, output_name)
-                if output_bytes:
-                    st.success("Processing complete!")
-                    st.download_button(label="Download Filled Template", data=output_bytes,
-                        file_name=output_name,
+                out = process_excel(template_file, report_file, damages_file, output_name)
+                if out:
+                    st.success("Done!")
+                    st.download_button("Download", data=out, file_name=output_name,
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         else:
-            st.warning("Upload all required files.")
+            st.warning("Upload all 3 files.")
 
 elif tool == "EFRIS Invoice Enricher":
     st.header("EFRIS Invoice Enricher")
     st.markdown("""
-    Upload your **Purchases Report** (.xlsx). The tool will validate each FDN on EFRIS
-    and fill in **Quantity**, **Unit Measure**, and **Unit Price** for every row.
-
-    > Each unique FDN is only fetched once — duplicates use cached data.
+    Upload your **Purchases Report** (.xlsx) with columns **FDN** and **Description of Goods**.
+    The tool opens each invoice on EFRIS, reads the PDF, and fills in
+    **Quantity**, **Unit Measure**, and **Unit Price** for every row.
+    > Duplicate FDNs are only fetched once.
     """)
     col1, col2 = st.columns([2, 1])
     with col1:
-        purchases_file = st.file_uploader("Upload Purchases Report (.xlsx)", type=["xlsx"], key="efris_upload")
+        purchases_file = st.file_uploader("Upload Purchases Report (.xlsx)", type=["xlsx"], key="ef_up")
     with col2:
-        output_filename = st.text_input("Output Filename", value="enriched_purchases_report", key="efris_out")
-        output_filename = output_filename.removesuffix(".xlsx").strip() + ".xlsx"
+        out_name = st.text_input("Output Filename", value="enriched_purchases", key="ef_out")
+        out_name = out_name.removesuffix(".xlsx").strip() + ".xlsx"
+
     if purchases_file:
         try:
-            preview_df = pd.read_excel(purchases_file, nrows=5)
+            prev = pd.read_excel(purchases_file, nrows=5)
             purchases_file.seek(0)
-            st.markdown("**Preview (first 5 rows):**")
-            st.dataframe(preview_df, use_container_width=True)
-            missing = {"FDN", "Description of Goods"} - set(preview_df.columns)
+            st.markdown("**Preview:**")
+            st.dataframe(prev, use_container_width=True)
+            missing = {"FDN", "Description of Goods"} - set(prev.columns)
             if missing:
-                st.error(f"Missing required columns: {missing}")
+                st.error(f"Missing columns: {missing}")
                 purchases_file = None
         except Exception as e:
-            st.error(f"Could not read file: {e}")
+            st.error(str(e))
             purchases_file = None
-    if st.button("🚀 Start EFRIS Enrichment", disabled=(purchases_file is None), key="efris_run"):
+
+    if st.button("🚀 Start Enrichment", disabled=(purchases_file is None), key="ef_run"):
         st.markdown("---")
-        st.markdown("### Live Progress")
-        progress_bar    = st.progress(0, text="Starting...")
-        log_placeholder = st.empty()
+        prog = st.progress(0, text="Starting...")
+        log_ph = st.empty()
         try:
-            full_df     = pd.read_excel(purchases_file)
-            enriched_df = run_efris_enrichment(full_df, log_placeholder, progress_bar)
-            progress_bar.progress(1.0, text="✅ Done!")
-            st.success("Enrichment complete!")
-            output_bytes = build_output_excel(enriched_df)
-            st.download_button(label="⬇️ Download Enriched Excel", data=output_bytes,
-                file_name=output_filename,
+            df = pd.read_excel(purchases_file)
+            enriched = run_efris_enrichment(df, log_ph, prog)
+            prog.progress(1.0, text="✅ Done!")
+            st.success("Complete!")
+            st.download_button("⬇️ Download Enriched Excel",
+                data=build_output_excel(enriched), file_name=out_name,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            filled = enriched_df["Quantity"].notna().sum()
-            st.info(f"📊 **{filled} / {len(enriched_df)}** rows successfully enriched.")
+            filled = enriched["Quantity"].notna().sum()
+            st.info(f"📊 {filled} / {len(enriched)} rows enriched.")
         except Exception as e:
-            st.error(f"An unexpected error occurred: {e}")
+            st.error(f"Error: {e}")
 
-elif tool == "Audit Compliance Checker (Coming Soon)":
-    st.header("Audit Compliance Checker")
-    st.info("Coming soon – contact for early access.")
-
-elif tool == "Financial Report Generator (Coming Soon)":
-    st.header("Financial Report Generator")
-    st.info("Feature in development.")
-
-elif tool == "Sales Dashboard (Inspired by Reference)":
-    st.header("Sales Dashboard")
-    st.info("Upload data to get started.")
-    sales_data = st.file_uploader("Upload Sales Data (.xlsx)", type="xlsx")
-    if sales_data:
-        st.write("Data uploaded – dashboard coming soon!")
+elif "Coming Soon" in tool:
+    st.info("Feature coming soon.")
 
 st.sidebar.markdown("---")
 st.sidebar.info("Powered by Streamlit on Railway.")
