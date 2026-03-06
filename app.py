@@ -223,18 +223,19 @@ def _get_driver():
     options.add_argument("--no-zygote")
 
     # ── Locate browser binary ─────────────────────────────────────────────────
-    # python:3.11-slim (Debian bookworm) puts chromium at /usr/bin/chromium
+    # On Debian bookworm (python:3.11-slim), chromium-driver installs to
+    # /usr/lib/chromium/ — NOT /usr/bin/
     BROWSER_CANDIDATES = [
+        "/usr/lib/chromium/chromium",           # Debian bookworm primary
         "/usr/bin/chromium",
         "/usr/bin/chromium-browser",
+        "/usr/lib/chromium-browser/chromium-browser",
         "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
     ]
     # ── Locate chromedriver ───────────────────────────────────────────────────
-    # chromium-driver package puts chromedriver at /usr/bin/chromedriver
     DRIVER_CANDIDATES = [
+        "/usr/lib/chromium/chromedriver",       # Debian bookworm primary
         "/usr/bin/chromedriver",
-        "/usr/lib/chromium/chromedriver",
         "/usr/lib/chromium-browser/chromedriver",
     ]
 
