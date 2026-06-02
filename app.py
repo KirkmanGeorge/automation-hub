@@ -506,24 +506,25 @@ def build_output_excel(df):
 # TOOL 3: Raw Material Movement Filler
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Words that appear in standard mix header/output rows — never raw material names
+# Header / output row keywords that are never raw material or product names
 _SM_HEADER_WORDS = {
     'details', 'units', 'output', 'input', 'qty', 'price', 'amount',
     'unit', 'measure', 'total', 'description', 'items', 'sub',
     'out put', 'out', 'put',
 }
 
-def _normalize_abr(s):
-    """Remove all spaces and uppercase — so 'C S', 'CS', 'C s' all become 'CS'."""
-    return str(s).strip().upper().replace(' ', '')
+def _norm_name(s):
+    """Uppercase + strip — used as the matching key for product names."""
+    return str(s).strip().upper()
+
 
 def _detect_sm_structure(df):
     """
-    Dynamically find:
-      product_name_row  — first row where col 2 has a real product name
-      abr_row           — product_name_row + 1
-      material_start_row — first row (in col 0) with a real ingredient name
-    Works regardless of how many blank/header rows precede the data.
+    Dynamically locate the three key rows in ANY company's standard mix:
+      product_name_row   — first row where col C holds a real product name
+      abr_row            — product_name_row + 1  (abbreviations, kept for reference only)
+      material_start_row — first row in col A with a real ingredient name
+    Works regardless of how many header/blank rows appear before the data.
     """
     product_name_row = None
     for r in range(min(10, df.shape[0])):
@@ -539,7 +540,10 @@ def _detect_sm_structure(df):
         product_name_row = r
         break
     if product_name_row is None:
-        raise ValueError("Standard mix: cannot detect product name row (checked first 10 rows, col C).")
+        raise ValueError(
+            "Standard mix: cannot detect product name row. "
+            "Expected a product name in column C within the first 10 rows."
+        )
     abr_row = product_name_row + 1
     material_start_row = None
     for r in range(abr_row + 1, min(abr_row + 20, df.shape[0])):
@@ -555,23 +559,32 @@ def _detect_sm_structure(df):
         material_start_row = r
         break
     if material_start_row is None:
-        raise ValueError("Standard mix: cannot detect material start row (checked 20 rows after abbreviation row).")
+        raise ValueError(
+            "Standard mix: cannot detect material start row. "
+            "Expected an ingredient name in column A within 20 rows of the abbreviation row."
+        )
     return product_name_row, abr_row, material_start_row
 
 
 def _parse_standard_mix(sm_bytes):
     """
-    Dynamically parses any company's standard mix.
+    Parses any company's standard mix dynamically.
+
+    Matching key = NORMALISED PRODUCT NAME (uppercase, stripped).
+    ABRs are intentionally NOT used as keys because:
+      - The same ABR can appear for different products (e.g. 'BB' for both
+        'BANS BIG' and 'BUFFET BREAD' in some files).
+      - ABR spacing is inconsistent across files ('C S' vs 'CS').
+      - Product names are unambiguous and stable.
+
     Returns:
-      products  : {normalized_abr: {'name': str, 'ratios': {mat_name: float}}}
+      products  : {norm_product_name: {'name': str, 'ratios': {mat_name: float}}}
       materials : [(mat_name, unit)]
-    The products dict is keyed by NORMALIZED abbreviation (no spaces, uppercase)
-    so that 'C S', 'CS', 'C s' all resolve to the same product.
     """
     df = pd.read_excel(BytesIO(sm_bytes), header=None)
     product_name_row, abr_row, material_start_row = _detect_sm_structure(df)
 
-    # Read raw materials from col 0/1 starting at material_start_row
+    # Raw materials — col 0 = name, col 1 = unit, from material_start_row downward
     materials = []
     for r in range(material_start_row, df.shape[0]):
         mat_name = str(df.iloc[r, 0]).strip()
@@ -588,23 +601,26 @@ def _parse_standard_mix(sm_bytes):
         materials.append((mat_name, unit_clean))
 
     if not materials:
-        raise ValueError("Standard mix: no raw materials found. Check the file structure.")
+        raise ValueError(
+            "Standard mix: no raw materials found. "
+            "Check that ingredient names start in column A."
+        )
 
-    # Read products — every 5 columns starting at col 2
+    # Products — every 5 columns starting at col 2
+    # Keyed by normalised product NAME to avoid all ABR ambiguity
     products = {}
     for c in range(2, df.shape[1], 5):
         name_str = str(df.iloc[product_name_row, c]).strip()
-        abr_str  = str(df.iloc[abr_row,          c]).strip()
-        if name_str in ('nan', 'NaN', '') or abr_str in ('nan', 'NaN', ''):
+        # Skip empty, numeric, or header-keyword cells
+        if name_str in ('nan', 'NaN', ''):
             continue
         try:
             float(name_str); continue
         except ValueError:
             pass
-        try:
-            float(abr_str); continue
-        except ValueError:
-            pass
+        if name_str.lower() in _SM_HEADER_WORDS:
+            continue
+
         ratios = {}
         for i, (mat_name, _) in enumerate(materials):
             row_idx = material_start_row + i
@@ -613,54 +629,93 @@ def _parse_standard_mix(sm_bytes):
                 continue
             val = df.iloc[row_idx, c]
             try:
-                ratios[mat_name] = float(val) if str(val).strip() not in ('nan', 'NaN', '') else 0.0
+                ratios[mat_name] = (
+                    float(val) if str(val).strip() not in ('nan', 'NaN', '') else 0.0
+                )
             except (ValueError, TypeError):
                 ratios[mat_name] = 0.0
-        # Key by NORMALIZED abbreviation to handle spacing inconsistencies
-        products[_normalize_abr(abr_str)] = {'name': name_str, 'ratios': ratios}
+
+        norm = _norm_name(name_str)
+        # If two columns share the same normalised name, last one wins (edge case)
+        products[norm] = {'name': name_str, 'ratios': ratios}
 
     if not products:
-        raise ValueError("Standard mix: no valid products found. Check abbreviation row.")
+        raise ValueError(
+            "Standard mix: no valid products found. "
+            "Check that product names appear in the first detected row."
+        )
     return products, materials
 
 
 def _parse_finished_movement(fm_bytes):
     """
-    Reads col F (EXPECTED) per product per date from the finished movement.
-    expected_map is keyed by (date, NORMALIZED_ABR) so spacing variants
-    like 'C S' and 'CS' map to the same key.
+    Reads col B (product name) and col F (EXPECTED) for every row.
+    expected_map  keyed by (date, NORM_PRODUCT_NAME)
+    fm_products   set of original product name strings (for display in errors)
     """
     wb = openpyxl.load_workbook(BytesIO(fm_bytes), data_only=True)
     ws = wb.active
     expected_map = {}
-    fm_abrs      = set()
+    fm_products  = set()
     current_date = None
+
     for r in range(1, ws.max_row + 1):
         date_v = ws.cell(r, 1).value
-        abr_v  = ws.cell(r, 3).value
-        exp_v  = ws.cell(r, 6).value
+        name_v = ws.cell(r, 2).value   # col B — product full name
+        exp_v  = ws.cell(r, 6).value   # col F — EXPECTED
+
         if isinstance(date_v, datetime):
             current_date = date_v.date()
-        if not abr_v or not str(abr_v).strip():
+
+        if not name_v or not str(name_v).strip():
             continue
-        abr_str = str(abr_v).strip()
-        if abr_str.upper() in ('ABR', 'ABBREVIATION', 'ABR.'):
+        name_str = str(name_v).strip()
+
+        # Skip obvious header rows
+        if name_str.upper() in ('PRODUCTS', 'DETAILS', 'DATE', 'DESCRIPTION'):
             continue
-        fm_abrs.add(abr_str)
+
+        fm_products.add(name_str)
         if current_date is None:
             continue
+
         try:
             qty = float(exp_v) if exp_v not in (None, '') else 0.0
         except (ValueError, TypeError):
             qty = 0.0
-        key = (current_date, _normalize_abr(abr_str))
+
+        key = (current_date, _norm_name(name_str))
         expected_map[key] = expected_map.get(key, 0.0) + qty
-    return expected_map, fm_abrs
+
+    return expected_map, fm_products
+
+
+def _match_product_name(fm_name, sm_norm_names):
+    """
+    Match a single finished-movement product name to a standard-mix product name.
+    Returns (matched_norm_name_or_None, tag_string).
+    Uses: exact → fuzzy (best match, cutoff 0.60).
+    No substring check — fuzzy naturally picks the highest-ratio match.
+    """
+    t = _norm_name(fm_name)
+    if t in sm_norm_names:
+        return t, 'EXACT'
+    hits = difflib.get_close_matches(t, sm_norm_names, n=1, cutoff=0.60)
+    if hits:
+        return hits[0], 'FUZZY'
+    return None, 'NO MATCH'
 
 
 def _parse_rm_template(rm_bytes):
+    """
+    Reads the user's blank raw material template.
+    Detects block structure (materials per day) dynamically — works for any
+    number of materials (1 product kombucha up to 50+ product bakery).
+    """
     wb = openpyxl.load_workbook(BytesIO(rm_bytes))
     ws = wb.active
+
+    # First date row = start of day-1 block
     first_data_row = None
     for r in range(1, ws.max_row + 1):
         if isinstance(ws.cell(r, 1).value, datetime):
@@ -668,14 +723,18 @@ def _parse_rm_template(rm_bytes):
             break
     if first_data_row is None:
         raise ValueError("Raw material template: no date found in column A.")
+
+    # Second date row → block_size
     second_date_row = None
     for r in range(first_data_row + 1, ws.max_row + 1):
         if isinstance(ws.cell(r, 1).value, datetime):
             second_date_row = r
             break
+
     if second_date_row:
         block_size = second_date_row - first_data_row
     else:
+        # Single-day template: count until first blank in col B
         block_size = 0
         for r in range(first_data_row, ws.max_row + 1):
             if ws.cell(r, 2).value is None and r > first_data_row:
@@ -683,132 +742,205 @@ def _parse_rm_template(rm_bytes):
                 break
         if block_size == 0:
             block_size = ws.max_row - first_data_row + 1
-    n_materials   = block_size - 1
+
+    n_materials = block_size - 1   # last row in every block is the blank separator
+
+    # Read material names + units from day-1 block (col B = name, col C = unit)
     tpl_materials = []
     for i in range(n_materials):
-        r    = first_data_row + i
-        mat  = ws.cell(r, 2).value
-        unit = ws.cell(r, 3).value
+        r   = first_data_row + i
+        mat = ws.cell(r, 2).value
+        unt = ws.cell(r, 3).value
         if mat and str(mat).strip():
-            tpl_materials.append((i, str(mat).strip(), str(unit).strip() if unit else ''))
+            tpl_materials.append((
+                i,
+                str(mat).strip(),
+                str(unt).strip() if unt else ''
+            ))
+
+    # Map every date in the template to its block-start row
     date_to_block_start = {}
     for r in range(first_data_row, ws.max_row + 1):
         v = ws.cell(r, 1).value
         if isinstance(v, datetime):
             date_to_block_start[v.date()] = r
+
     return wb, ws, n_materials, tpl_materials, date_to_block_start
 
 
 def _smart_match_materials(tpl_materials, sm_materials):
+    """
+    Match raw material names in the template → raw material names in the
+    standard mix.  Uses exact then fuzzy (cutoff 0.65).
+    Returns match_map {tpl_name: sm_name_or_None}, unmatched list.
+    """
     sm_names  = [m[0] for m in sm_materials]
     sm_upper  = [m.upper().strip() for m in sm_names]
     match_map = {}
     unmatched = []
+
     for _, tpl_name, _ in tpl_materials:
-        t       = tpl_name.upper().strip()
+        t = tpl_name.upper().strip()
         matched = None
+
+        # 1. Exact
         if t in sm_upper:
             matched = sm_names[sm_upper.index(t)]
-        if not matched:
-            for i, s in enumerate(sm_upper):
-                if t.startswith(s) or s.startswith(t):
-                    matched = sm_names[i]
-                    break
+
+        # 2. Fuzzy — returns best match; no substring shortcut to avoid wrong greedy hits
         if not matched:
             hits = difflib.get_close_matches(t, sm_upper, n=1, cutoff=0.65)
             if hits:
                 matched = sm_names[sm_upper.index(hits[0])]
+
         match_map[tpl_name] = matched
         if not matched:
             unmatched.append(tpl_name)
+
     return match_map, unmatched
 
 
 def _calculate_and_fill(wb, ws, tpl_materials, date_to_block_start,
-                         match_map, products, expected_map):
+                         match_map, products, expected_map, fm_name_to_sm_norm):
+    """
+    For each day × each raw material:
+      col 9 = Σ ( ratio(material, product) × EXPECTED(product, day) )
+              summed over every finished product.
+
+    products      keyed by norm_product_name
+    expected_map  keyed by (date, norm_product_name_from_fm)
+    fm_name_to_sm_norm maps norm FM product name → norm SM product name
+                        (handles fuzzy name differences between files)
+    Only col 9 is written; all other formulas in the template are preserved.
+    """
     filled = 0
     for date_obj, block_start in sorted(date_to_block_start.items()):
         for offset, tpl_name, _ in tpl_materials:
-            sm_name = match_map.get(tpl_name)
-            if sm_name is None:
+            sm_mat_name = match_map.get(tpl_name)
+            if sm_mat_name is None:
                 continue
+
             total = 0.0
-            for norm_abr, prod in products.items():
-                # products keyed by normalized ABR; expected_map also uses normalized ABR
-                exp = expected_map.get((date_obj, norm_abr), 0.0)
-                if exp == 0.0:
+            for norm_fm, exp in expected_map.items():
+                if norm_fm[0] != date_obj or exp == 0.0:
                     continue
-                ratio  = prod['ratios'].get(sm_name, 0.0)
+                # Translate FM product name key → SM product name key
+                sm_norm = fm_name_to_sm_norm.get(norm_fm[1])
+                if sm_norm is None:
+                    continue
+                prod = products.get(sm_norm)
+                if prod is None:
+                    continue
+                ratio  = prod['ratios'].get(sm_mat_name, 0.0)
                 total += ratio * exp
+
             if total > 0:
                 ws.cell(block_start + offset, 9).value = round(total, 4)
                 filled += 1
+
     return wb, filled
 
 
 def process_raw_material_movement(sm_file, fm_file, rm_template_file, output_name):
+    """Master function called from Streamlit UI."""
     log = []
     def L(msg): log.append(msg)
+
     try:
+        # ── Step 1: Standard Mix ─────────────────────────────────────────────
         L("📋 Step 1 — Parsing standard mix...")
-        sm_bytes = sm_file.read()
+        sm_bytes  = sm_file.read()
         products, sm_materials = _parse_standard_mix(sm_bytes)
-        L(f"  ✅ {len(products)} finished products | {len(sm_materials)} raw materials")
+        L(f"  ✅ {len(products)} finished product(s) | {len(sm_materials)} raw material(s)")
+        L("  📦 Products in standard mix:")
+        for norm, p in products.items():
+            L(f"       • {p['name']}")
 
+        # ── Step 2: Finished Movement ────────────────────────────────────────
         L("📋 Step 2 — Parsing finished movement (EXPECTED column)...")
-        fm_bytes = fm_file.read()
-        expected_map, fm_abrs = _parse_finished_movement(fm_bytes)
-        non_zero = sum(1 for v in expected_map.values() if v > 0)
-        L(f"  ✅ {len(fm_abrs)} products | {len(expected_map)} date-product pairs ({non_zero} with data)")
+        fm_bytes  = fm_file.read()
+        expected_map, fm_products = _parse_finished_movement(fm_bytes)
+        non_zero  = sum(1 for v in expected_map.values() if v > 0)
+        L(f"  ✅ {len(fm_products)} product name(s) | "
+          f"{len(expected_map)} date-product pairs ({non_zero} with data)")
 
-        L("🔍 Step 3 — Validating product codes...")
-        # Compare using normalized ABRs (no spaces, uppercase) — catches 'C S'=='CS', 'R B'=='RB'
-        missing_abrs = sorted(
-            a for a in fm_abrs if _normalize_abr(a) not in products
-        )
-        if missing_abrs:
-            L(f"  ❌ {len(missing_abrs)} product(s) in finished movement not found in standard mix:")
-            for m in missing_abrs:
-                L(f"       • '{m}'  (normalized: '{_normalize_abr(m)}')")
-            L("  ⚠️  Update the standard mix to include ALL products before processing.")
+        # ── Step 3: Match FM product names → SM product names ────────────────
+        L("🔍 Step 3 — Matching finished movement products to standard mix...")
+        sm_norm_list = list(products.keys())   # normalised SM product names
+        fm_name_to_sm_norm = {}
+        missing = []
+        fuzzy_warnings = []
+
+        for fm_name in sorted(fm_products):
+            matched_norm, tag = _match_product_name(fm_name, sm_norm_list)
+            if matched_norm:
+                fm_name_to_sm_norm[_norm_name(fm_name)] = matched_norm
+                sm_display = products[matched_norm]['name']
+                L(f"       ✓ [{tag:8}]  '{fm_name}'  →  '{sm_display}'")
+                if tag == 'FUZZY':
+                    fuzzy_warnings.append((fm_name, sm_display))
+            else:
+                missing.append(fm_name)
+                L(f"       ✗ [NO MATCH]  '{fm_name}'  →  NOT FOUND in standard mix")
+
+        if missing:
+            L(f"  ❌ {len(missing)} product(s) from the finished movement could not be "
+              f"matched to any product in the standard mix:")
+            for m in missing:
+                L(f"       • '{m}'")
+            L("  ⚠️  Add these products to the standard mix before processing.")
             return None, log
-        L(f"  ✅ All {len(fm_abrs)} product codes matched")
 
+        if fuzzy_warnings:
+            L(f"  ⚠️  {len(fuzzy_warnings)} product(s) matched by fuzzy name — "
+              f"please verify these are correct:")
+            for fm_n, sm_n in fuzzy_warnings:
+                L(f"       '{fm_n}'  →  '{sm_n}'")
+
+        L(f"  ✅ All {len(fm_products)} product(s) matched successfully")
+
+        # ── Step 4: Raw Material Template ────────────────────────────────────
         L("📋 Step 4 — Reading raw material template structure...")
-        rm_bytes = rm_template_file.read()
+        rm_bytes  = rm_template_file.read()
         wb, ws, n_materials, tpl_materials, date_to_block_start = _parse_rm_template(rm_bytes)
-        L(f"  ✅ {len(date_to_block_start)} day(s) | {n_materials} materials per day")
+        L(f"  ✅ {len(date_to_block_start)} day(s) | {n_materials} material row(s) per day")
         L("  📄 Template materials:")
         for _, name, unit in tpl_materials:
             L(f"       • {name} ({unit})")
 
+        # ── Step 5: Match template material names → SM material names ────────
         L("🔗 Step 5 — Matching template materials to standard mix...")
         match_map, unmatched = _smart_match_materials(tpl_materials, sm_materials)
         matched_n = sum(1 for v in match_map.values() if v)
-        L(f"  ✅ {matched_n}/{len(tpl_materials)} materials matched")
+        L(f"  ✅ {matched_n}/{len(tpl_materials)} raw material(s) matched")
         for tpl_n, sm_n in match_map.items():
             if sm_n:
                 tag = "EXACT" if tpl_n.upper().strip() == sm_n.upper().strip() else "FUZZY"
                 L(f"       ✓ [{tag}]  '{tpl_n}'  →  '{sm_n}'")
             else:
-                L(f"       ✗ [NO MATCH]  '{tpl_n}'  →  will be left blank")
+                L(f"       ✗ [NO MATCH]  '{tpl_n}'  →  will be left blank in output")
         if unmatched:
-            L(f"  ⚠️  {len(unmatched)} unmatched material(s) — verify spelling in standard mix")
+            L(f"  ⚠️  {len(unmatched)} raw material(s) unmatched — "
+              f"verify spelling between template and standard mix")
 
+        # ── Step 6: Calculate and fill ───────────────────────────────────────
         L("⚙️  Step 6 — Calculating STOCK ISSUED TO PRODUCTION...")
         wb_out, filled = _calculate_and_fill(
             wb, ws, tpl_materials, date_to_block_start,
-            match_map, products, expected_map
+            match_map, products, expected_map, fm_name_to_sm_norm
         )
-        L(f"  ✅ {filled} cell(s) written to STOCK ISSUED TO PRODUCTION column")
+        L(f"  ✅ {filled} cell(s) written to STOCK ISSUED TO PRODUCTION (col I)")
 
         out = BytesIO()
         wb_out.save(out)
         out.seek(0)
-        L(f"✅ Complete! Ready to download: {output_name}")
+        L(f"✅ Complete — ready to download: {output_name}")
         return out, log
+
     except Exception as e:
+        import traceback
         L(f"❌ Error: {str(e)}")
+        L(traceback.format_exc())
         return None, log
 
 
