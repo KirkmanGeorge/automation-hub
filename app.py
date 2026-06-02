@@ -506,10 +506,74 @@ def build_output_excel(df):
 # TOOL 3: Raw Material Movement Filler
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Words that appear in standard mix header/output rows — never raw material names
+_SM_HEADER_WORDS = {
+    'details', 'units', 'output', 'input', 'qty', 'price', 'amount',
+    'unit', 'measure', 'total', 'description', 'items', 'sub',
+    'out put', 'out', 'put',
+}
+
+def _normalize_abr(s):
+    """Remove all spaces and uppercase — so 'C S', 'CS', 'C s' all become 'CS'."""
+    return str(s).strip().upper().replace(' ', '')
+
+def _detect_sm_structure(df):
+    """
+    Dynamically find:
+      product_name_row  — first row where col 2 has a real product name
+      abr_row           — product_name_row + 1
+      material_start_row — first row (in col 0) with a real ingredient name
+    Works regardless of how many blank/header rows precede the data.
+    """
+    product_name_row = None
+    for r in range(min(10, df.shape[0])):
+        v = str(df.iloc[r, 2]).strip()
+        if v in ('nan', 'NaN', ''):
+            continue
+        try:
+            float(v); continue
+        except ValueError:
+            pass
+        if v.lower() in _SM_HEADER_WORDS:
+            continue
+        product_name_row = r
+        break
+    if product_name_row is None:
+        raise ValueError("Standard mix: cannot detect product name row (checked first 10 rows, col C).")
+    abr_row = product_name_row + 1
+    material_start_row = None
+    for r in range(abr_row + 1, min(abr_row + 20, df.shape[0])):
+        v = str(df.iloc[r, 0]).strip()
+        if v in ('nan', 'NaN', ''):
+            continue
+        try:
+            float(v); continue
+        except ValueError:
+            pass
+        if v.lower() in _SM_HEADER_WORDS:
+            continue
+        material_start_row = r
+        break
+    if material_start_row is None:
+        raise ValueError("Standard mix: cannot detect material start row (checked 20 rows after abbreviation row).")
+    return product_name_row, abr_row, material_start_row
+
+
 def _parse_standard_mix(sm_bytes):
+    """
+    Dynamically parses any company's standard mix.
+    Returns:
+      products  : {normalized_abr: {'name': str, 'ratios': {mat_name: float}}}
+      materials : [(mat_name, unit)]
+    The products dict is keyed by NORMALIZED abbreviation (no spaces, uppercase)
+    so that 'C S', 'CS', 'C s' all resolve to the same product.
+    """
     df = pd.read_excel(BytesIO(sm_bytes), header=None)
+    product_name_row, abr_row, material_start_row = _detect_sm_structure(df)
+
+    # Read raw materials from col 0/1 starting at material_start_row
     materials = []
-    for r in range(7, df.shape[0]):
+    for r in range(material_start_row, df.shape[0]):
         mat_name = str(df.iloc[r, 0]).strip()
         mat_unit = str(df.iloc[r, 1]).strip()
         if mat_name in ('nan', 'NaN', ''):
@@ -518,14 +582,19 @@ def _parse_standard_mix(sm_bytes):
             float(mat_name); break
         except ValueError:
             pass
+        if mat_name.lower() in _SM_HEADER_WORDS:
+            continue
         unit_clean = mat_unit if mat_unit not in ('nan', 'NaN', '') else ''
         materials.append((mat_name, unit_clean))
+
     if not materials:
-        raise ValueError("Standard mix: no raw materials found from row 8 onwards.")
+        raise ValueError("Standard mix: no raw materials found. Check the file structure.")
+
+    # Read products — every 5 columns starting at col 2
     products = {}
     for c in range(2, df.shape[1], 5):
-        name_str = str(df.iloc[1, c]).strip()
-        abr_str  = str(df.iloc[2, c]).strip()
+        name_str = str(df.iloc[product_name_row, c]).strip()
+        abr_str  = str(df.iloc[abr_row,          c]).strip()
         if name_str in ('nan', 'NaN', '') or abr_str in ('nan', 'NaN', ''):
             continue
         try:
@@ -538,7 +607,7 @@ def _parse_standard_mix(sm_bytes):
             pass
         ratios = {}
         for i, (mat_name, _) in enumerate(materials):
-            row_idx = 7 + i
+            row_idx = material_start_row + i
             if row_idx >= df.shape[0]:
                 ratios[mat_name] = 0.0
                 continue
@@ -547,13 +616,20 @@ def _parse_standard_mix(sm_bytes):
                 ratios[mat_name] = float(val) if str(val).strip() not in ('nan', 'NaN', '') else 0.0
             except (ValueError, TypeError):
                 ratios[mat_name] = 0.0
-        products[abr_str] = {'name': name_str, 'ratios': ratios}
+        # Key by NORMALIZED abbreviation to handle spacing inconsistencies
+        products[_normalize_abr(abr_str)] = {'name': name_str, 'ratios': ratios}
+
     if not products:
-        raise ValueError("Standard mix: no valid products with abbreviations found.")
+        raise ValueError("Standard mix: no valid products found. Check abbreviation row.")
     return products, materials
 
 
 def _parse_finished_movement(fm_bytes):
+    """
+    Reads col F (EXPECTED) per product per date from the finished movement.
+    expected_map is keyed by (date, NORMALIZED_ABR) so spacing variants
+    like 'C S' and 'CS' map to the same key.
+    """
     wb = openpyxl.load_workbook(BytesIO(fm_bytes), data_only=True)
     ws = wb.active
     expected_map = {}
@@ -577,7 +653,7 @@ def _parse_finished_movement(fm_bytes):
             qty = float(exp_v) if exp_v not in (None, '') else 0.0
         except (ValueError, TypeError):
             qty = 0.0
-        key = (current_date, abr_str)
+        key = (current_date, _normalize_abr(abr_str))
         expected_map[key] = expected_map.get(key, 0.0) + qty
     return expected_map, fm_abrs
 
@@ -657,8 +733,9 @@ def _calculate_and_fill(wb, ws, tpl_materials, date_to_block_start,
             if sm_name is None:
                 continue
             total = 0.0
-            for abr, prod in products.items():
-                exp = expected_map.get((date_obj, abr), 0.0)
+            for norm_abr, prod in products.items():
+                # products keyed by normalized ABR; expected_map also uses normalized ABR
+                exp = expected_map.get((date_obj, norm_abr), 0.0)
                 if exp == 0.0:
                     continue
                 ratio  = prod['ratios'].get(sm_name, 0.0)
@@ -685,11 +762,14 @@ def process_raw_material_movement(sm_file, fm_file, rm_template_file, output_nam
         L(f"  ✅ {len(fm_abrs)} products | {len(expected_map)} date-product pairs ({non_zero} with data)")
 
         L("🔍 Step 3 — Validating product codes...")
-        missing_abrs = sorted(fm_abrs - set(products.keys()))
+        # Compare using normalized ABRs (no spaces, uppercase) — catches 'C S'=='CS', 'R B'=='RB'
+        missing_abrs = sorted(
+            a for a in fm_abrs if _normalize_abr(a) not in products
+        )
         if missing_abrs:
             L(f"  ❌ {len(missing_abrs)} product(s) in finished movement not found in standard mix:")
             for m in missing_abrs:
-                L(f"       • '{m}'")
+                L(f"       • '{m}'  (normalized: '{_normalize_abr(m)}')")
             L("  ⚠️  Update the standard mix to include ALL products before processing.")
             return None, log
         L(f"  ✅ All {len(fm_abrs)} product codes matched")
