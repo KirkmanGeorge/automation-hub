@@ -279,7 +279,6 @@ def _get_driver():
     options.add_argument("--disable-background-timer-throttling")
     options.add_argument("--disable-backgrounding-occluded-windows")
     options.add_argument("--disable-renderer-backgrounding")
-    options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
     browser_candidates = [
         "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable",
         "/usr/lib/chromium/chromium", "/usr/bin/chromium", "/usr/bin/chromium-browser",
@@ -306,19 +305,23 @@ def _scrape_fdn(driver, fdn, log_fn=None):
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
-    import requests as req_lib, json
 
     def dbg(msg):
         print(msg)
         if log_fn:
             log_fn(msg)
 
+    # The whole EFRIS form lives inside <iframe id="ifm">, so every element
+    # lookup below must happen after switching into it — the top-level
+    # document has no <input>/<button> elements at all.
     items = []
-    original_handle = driver.current_window_handle
     try:
         driver.get("https://efris.ura.go.ug/")
         wait = WebDriverWait(driver, 20)
-        dbg("  [1] Loaded EFRIS")
+        form_frame = wait.until(EC.presence_of_element_located((By.ID, "ifm")))
+        driver.switch_to.frame(form_frame)
+        dbg("  [1] Loaded EFRIS, entered form iframe")
+
         inp = wait.until(EC.presence_of_element_located((By.XPATH,
             "//input[@placeholder and ("
             "contains(translate(@placeholder,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'fiscal')"
@@ -327,81 +330,53 @@ def _scrape_fdn(driver, fdn, log_fn=None):
         )))
         inp.clear(); inp.send_keys(str(fdn)); time.sleep(0.4)
         dbg("  [2] FDN typed")
-        btn = wait.until(EC.element_to_be_clickable((By.XPATH,
-            "//button[contains(translate(normalize-space(.),"
+
+        # "Validate" is a <span> inside a custom button component, not a
+        # real <button> element.
+        validate_el = wait.until(EC.presence_of_element_located((By.XPATH,
+            "//span[contains(translate(normalize-space(.),"
             "'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'VALIDATE')]"
         )))
-        btn.click(); time.sleep(3); dbg("  [3] Validated")
-        wait.until(EC.presence_of_element_located((By.XPATH,
-            "//*[contains(text(),'erified') or contains(text(),'Validation')]"
-        ))); time.sleep(1); dbg("  [4] Invoice verified")
-        handles_before = set(driver.window_handles)
-        vbtn = wait.until(EC.element_to_be_clickable((By.XPATH,
-            "//button[contains(translate(normalize-space(.),"
-            "'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'VIEW DOCUMENT')]"
-        )))
-        vbtn.click(); time.sleep(5); dbg("  [5] View Document clicked")
-        pdf_url = None
-        try:
-            logs = driver.get_log("performance")
-            for entry in logs:
-                msg = json.loads(entry["message"])["message"]
-                if msg.get("method") == "Network.responseReceived":
-                    url  = msg.get("params", {}).get("response", {}).get("url", "")
-                    mime = msg.get("params", {}).get("response", {}).get("mimeType", "")
-                    if "pdf" in mime.lower() or (url and ".pdf" in url.lower()):
-                        pdf_url = url; break
-        except Exception as e:
-            dbg(f"  [6-CDP] Log error: {e}")
-        if not pdf_url:
-            new_handles = set(driver.window_handles) - handles_before
-            if new_handles:
-                driver.switch_to.window(list(new_handles)[0]); time.sleep(2)
-                pdf_url = driver.current_url
-                driver.close(); driver.switch_to.window(original_handle)
-        if not pdf_url:
-            src = driver.page_source
-            for u in re.findall(r'https?://[^\s"\'<>\\]+', src):
-                if ".pdf" in u.lower() or "printInvoice" in u or "viewDoc" in u:
-                    pdf_url = u; break
-        if not pdf_url:
-            for tag in ["embed", "iframe", "object", "a"]:
-                for el in driver.find_elements(By.TAG_NAME, tag):
-                    for attr in ["src", "data", "href"]:
-                        val = el.get_attribute(attr) or ""
-                        if val and ("pdf" in val.lower() or "invoice" in val.lower()):
-                            pdf_url = val; break
-                    if pdf_url: break
-                if pdf_url: break
-        pdf_bytes = None
-        if pdf_url and pdf_url.startswith("http"):
-            cookies = {c["name"]: c["value"] for c in driver.get_cookies()}
-            headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://efris.ura.go.ug/"}
-            try:
-                resp = req_lib.get(pdf_url, cookies=cookies, headers=headers, timeout=30)
-                if resp.status_code == 200 and len(resp.content) > 500:
-                    pdf_bytes = resp.content
-            except Exception as e:
-                dbg(f"  [8] Download error: {e}")
-        elif pdf_url and pdf_url.startswith("blob:"):
-            try:
-                js  = ("var cb=arguments[arguments.length-1];"
-                       "fetch(arguments[0]).then(r=>r.arrayBuffer())"
-                       ".then(b=>cb(Array.from(new Uint8Array(b)))).catch(e=>cb([]));")
-                arr = driver.execute_async_script(js, pdf_url)
-                if arr:
-                    pdf_bytes = bytes(arr)
-            except Exception as e:
-                dbg(f"  [8] Blob error: {e}")
-        if pdf_bytes:
+        validate_el.click()
+        dbg("  [3] Validate clicked")
+
+        # A successful validation opens a second, dynamically-created iframe
+        # at the top level (not nested inside #ifm) holding the report.
+        driver.switch_to.default_content()
+        report_frame = wait.until(EC.presence_of_element_located(
+            (By.XPATH, "//iframe[contains(@src,'investigationValidationReport')]")))
+        driver.switch_to.frame(report_frame)
+        dbg("  [4] Invoice verified")
+
+        # The invoice PDF sits at a predictable URL keyed by FDN and is
+        # fetchable directly — no need to click "View Document" and sniff
+        # network logs for it. Must be fetched via the page's own fetch()
+        # (same-origin, carries real browser session/TLS fingerprint);
+        # a plain `requests` call to this URL hangs/times out.
+        pdf_url = f"https://efris.ura.go.ug/sit/investigation/validation/view?invoiceNo={fdn}"
+        driver.switch_to.default_content()
+        js = (
+            "var cb = arguments[arguments.length-1];"
+            "fetch(arguments[0], {credentials: 'include'})"
+            ".then(r => r.ok ? r.arrayBuffer() : Promise.reject('HTTP ' + r.status))"
+            ".then(b => cb(Array.from(new Uint8Array(b))))"
+            ".catch(e => cb('ERR:' + e));"
+        )
+        driver.set_script_timeout(30)
+        result = driver.execute_async_script(js, pdf_url)
+        if isinstance(result, str):
+            dbg(f"  [5] PDF fetch failed: {result}")
+        else:
+            pdf_bytes = bytes(result)
+            dbg(f"  [5] PDF fetched ({len(pdf_bytes)} bytes)")
             items = _parse_pdf_bytes(pdf_bytes)
     except Exception as e:
         dbg(f"  [ERR] {e}")
-    try:
-        if driver.current_window_handle != original_handle:
-            driver.switch_to.window(original_handle)
-    except Exception:
-        pass
+    finally:
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
     return items
 
 
@@ -412,11 +387,16 @@ def fuzzy_match(target, candidates):
     return candidates[cs.index(ms[0])] if ms else None
 
 
+EFRIS_CONCURRENCY = 3  # number of invoices scraped in parallel
+
+
 def run_efris_enrichment(purchases_df, log_placeholder, progress_bar):
+    import threading, queue
+
     for col in ["Quantity", "Unit Measure", "Unit Price"]:
         if col not in purchases_df.columns:
             purchases_df[col] = None
-    total, log_lines = len(purchases_df), []
+    log_lines = []
     def log(msg):
         log_lines.append(msg)
         log_placeholder.markdown(
@@ -427,61 +407,140 @@ def run_efris_enrichment(purchases_df, log_placeholder, progress_bar):
         p = shutil.which(name) or next(
             (c for c in [f"/usr/lib/chromium/{name}", f"/usr/bin/{name}"] if os.path.exists(c)), None)
         log(f"{'✅' if p else '❌'}  {name} → {p or 'not found'}")
-    log("🚀 Starting browser...")
-    try:
-        driver = _get_driver()
-        log("✅ Browser started!")
-    except Exception as e:
-        st.error(f"Browser failed: {e}")
+
+    # Collect the unique FDNs that actually need scraping (first-appearance order).
+    ordered_fdns, seen = [], set()
+    for _, row in purchases_df.iterrows():
+        fdn = str(row.get("FDN", "")).strip()
+        if fdn and fdn.lower() != "nan" and fdn not in seen:
+            seen.add(fdn); ordered_fdns.append(fdn)
+    total_fdns = len(ordered_fdns)
+    if total_fdns == 0:
+        log("⚠️  No FDNs found in this file.")
         return purchases_df
-    fdn_cache = {}
-    try:
-        for idx, row in purchases_df.iterrows():
-            fdn  = str(row.get("FDN", "")).strip()
-            desc = str(row.get("Description of Goods", "")).strip()
-            row_num = idx + 2
-            progress_bar.progress(min((idx + 1) / total, 1.0), text=f"Row {idx+1}/{total} — {fdn}")
-            if not fdn or fdn.lower() == "nan":
-                log(f"[Row {row_num}] ⚠️  Skipped — no FDN"); continue
-            if fdn not in fdn_cache:
-                log(f"[Row {row_num}] 🔍  FDN: {fdn} | {desc}")
-                try:
-                    fdn_cache[fdn] = _scrape_fdn(driver, fdn, log_fn=log)
-                    log(f"[Row {row_num}] ✅  {len(fdn_cache[fdn])} item(s) found")
-                except Exception as e:
-                    fdn_cache[fdn] = []; log(f"[Row {row_num}] ❌  {e}")
-            else:
-                log(f"[Row {row_num}] 📋  Cached — {fdn}")
-            invoice_items = fdn_cache[fdn]
-            if not invoice_items:
-                continue
-            invoice_names = [i["item"] for i in invoice_items]
-            matched = fuzzy_match(desc, invoice_names)
-            if matched:
-                hit = next((i for i in invoice_items if i["item"].strip().upper() == matched.strip().upper()), None)
-                if hit:
-                    purchases_df.at[idx, "Quantity"]     = hit["quantity"]
-                    purchases_df.at[idx, "Unit Measure"] = hit["unit_measure"]
-                    purchases_df.at[idx, "Unit Price"]   = hit["unit_price"]
-                    log(f"[Row {row_num}] ✔️  '{desc}' → Qty:{hit['quantity']} Unit:{hit['unit_measure']} Price:{hit['unit_price']}")
-                else:
-                    log(f"[Row {row_num}] ⚠️  Lookup failed: {matched}")
-            else:
-                log(f"[Row {row_num}] ⚠️  No match for '{desc}'")
-    finally:
+
+    log(f"🚀 Scraping {total_fdns} unique invoice(s) with {EFRIS_CONCURRENCY} concurrent session(s)...")
+
+    # Each worker owns one persistent browser for its whole lifetime (reused
+    # across every FDN it processes, not relaunched per invoice) and pulls
+    # FDNs off a shared queue until it's empty. Workers never touch the
+    # Streamlit placeholders directly — only the main thread does, via
+    # results_q — since Streamlit UI calls aren't safe from background
+    # threads.
+    work_q = queue.Queue()
+    for fdn in ordered_fdns:
+        work_q.put(fdn)
+    results_q = queue.Queue()
+
+    def worker():
         try:
-            driver.quit()
-        except Exception:
-            pass
+            driver = _get_driver()
+        except Exception as e:
+            while True:
+                try:
+                    fdn = work_q.get_nowait()
+                except queue.Empty:
+                    break
+                results_q.put((fdn, [], f"browser failed to start: {e}"))
+            return
+        try:
+            while True:
+                try:
+                    fdn = work_q.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    items = _scrape_fdn(driver, fdn, log_fn=None)
+                    results_q.put((fdn, items, None))
+                except Exception as e:
+                    results_q.put((fdn, [], str(e)))
+        finally:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(EFRIS_CONCURRENCY)]
+    for t in threads:
+        t.start()
+
+    fdn_cache = {}
+    for i in range(total_fdns):
+        fdn, items, err = results_q.get()
+        fdn_cache[fdn] = items
+        progress_bar.progress(min((i + 1) / total_fdns, 1.0), text=f"{i+1}/{total_fdns} invoices scraped")
+        if err:
+            log(f"[FDN {fdn}] ❌  {err}")
+        else:
+            log(f"[FDN {fdn}] ✅  {len(items)} item(s) found")
+    for t in threads:
+        t.join()
+
+    log("🔗 Matching report rows to invoice items...")
+    # Match against the remaining, unclaimed items for each invoice — once an
+    # item is used it's removed, so two report rows with the same description
+    # (e.g. an invoice listing one item twice at different quantities) each
+    # get a distinct invoice line instead of both being assigned whichever
+    # one matches first.
+    fdn_pool = {fdn: list(items) for fdn, items in fdn_cache.items()}
+    for idx, row in purchases_df.iterrows():
+        fdn  = str(row.get("FDN", "")).strip()
+        desc = str(row.get("Description of Goods", "")).strip()
+        row_num = idx + 2
+        if not fdn or fdn.lower() == "nan":
+            log(f"[Row {row_num}] ⚠️  Skipped — no FDN"); continue
+        invoice_items = fdn_pool.get(fdn, [])
+        if not invoice_items:
+            log(f"[Row {row_num}] ⚠️  No unclaimed invoice items left for '{desc}'")
+            continue
+        invoice_names = [i["item"] for i in invoice_items]
+        matched = fuzzy_match(desc, invoice_names)
+        if matched:
+            hit_idx = next((i for i, it in enumerate(invoice_items)
+                             if it["item"].strip().upper() == matched.strip().upper()), None)
+            if hit_idx is not None:
+                hit = invoice_items.pop(hit_idx)
+                purchases_df.at[idx, "Quantity"]     = hit["quantity"]
+                purchases_df.at[idx, "Unit Measure"] = hit["unit_measure"]
+                purchases_df.at[idx, "Unit Price"]   = hit["unit_price"]
+                log(f"[Row {row_num}] ✔️  '{desc}' → Qty:{hit['quantity']} Unit:{hit['unit_measure']} Price:{hit['unit_price']}")
+            else:
+                log(f"[Row {row_num}] ⚠️  Lookup failed: {matched}")
+        else:
+            log(f"[Row {row_num}] ⚠️  No match for '{desc}'")
+
     log("🏁 All rows processed.")
     return purchases_df
 
 
-def build_output_excel(df):
+def _read_purchases_report(file_obj):
+    """
+    Reads a URA 'VAT Purchases Report' export (.xls or .xlsx). These exports
+    have a few title/notice rows above the real header, so the header row
+    is located dynamically instead of assumed to be row 0.
+    """
+    raw = pd.read_excel(file_obj, header=None, nrows=20)
+    header_row = None
+    for i in range(len(raw)):
+        row_vals = [str(v).strip().upper() for v in raw.iloc[i].tolist()]
+        if "FDN" in row_vals and any("DESCRIPTION OF GOODS" in v for v in row_vals):
+            header_row = i
+            break
+    if header_row is None:
+        raise ValueError(
+            "Could not find a header row containing 'FDN' and "
+            "'Description of Goods' in the first 20 rows."
+        )
+    file_obj.seek(0)
+    return pd.read_excel(file_obj, header=header_row)
+
+
+def build_output_excel(df, sheet_name="Purchases Report",
+                        highlight_cols=("Quantity", "Unit Measure", "Unit Price")):
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Purchases Report")
-        ws = writer.sheets["Purchases Report"]
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+        ws = writer.sheets[sheet_name]
         for col_cells in ws.columns:
             max_len = max((len(str(c.value or "")) for c in col_cells), default=10)
             ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 4, 50)
@@ -492,7 +551,7 @@ def build_output_excel(df):
             cell.font = Font(bold=True, color="FFFFFF")
             cell.alignment = Alignment(horizontal="center")
         hi_fill  = PatternFill("solid", fgColor="FFF2CC")
-        new_cols = {"Quantity", "Unit Measure", "Unit Price"}
+        new_cols = set(highlight_cols)
         for i, c in enumerate(ws[1]):
             if c.value in new_cols:
                 for row in ws.iter_rows(min_row=2, min_col=i+1, max_col=i+1):
@@ -500,6 +559,201 @@ def build_output_excel(df):
                         cell.fill = hi_fill
     output.seek(0)
     return output
+
+
+_PACK_RE = re.compile(r'[X*]\s*(\d+)\b')
+
+
+def _product_tokens(name):
+    """
+    Splits a product name into (size, pack_count, core_words). Used so
+    stock-item matching can require pack size and case count to actually
+    agree, and require the remaining brand/flavor words to overlap — a
+    plain whole-string similarity ratio is unsafe here, since two genuinely
+    different SKUs sharing the same boilerplate ("... 500ml x 12") often
+    differ only in one short flavor word, which barely moves a
+    character-level ratio (e.g. "Oner Mango 500ml x 12" vs
+    "Oner Apple 500ml x 12" is ~85% similar character-for-character despite
+    being a completely different product).
+
+    The pack count ("x 12", "*12") is stripped out first so its digits
+    aren't mistaken for a size; whatever number remains is treated as the
+    size regardless of whether it carries an explicit unit — e.g. "Ginger
+    125 x 12" and "Ginger 200 x 12" are different products even though
+    neither names a unit (kg/g/etc).
+    """
+    upper = str(name).upper()
+    pack_m = _PACK_RE.search(upper)
+    pack = pack_m.group(1) if pack_m else None
+    without_pack = _PACK_RE.sub(' ', upper)
+    size_nums = re.findall(r'\d+(?:\.\d+)?', without_pack)
+    size = size_nums[0] if size_nums else None
+    core_words = [w for w in re.findall(r'[A-Z]+', without_pack) if len(w) > 1]
+    return size, pack, core_words
+
+
+def _match_stock_item(stock_name, candidate_descs, cutoff=0.60):
+    """
+    Stricter matcher for Stock List -> purchase-history lookups than
+    fuzzy_match() (which is fine for its original job of picking a line item
+    out of one already-known invoice, where collisions are unlikely).
+    Matching one stock item against the *entire* product history is a much
+    riskier search: requires detected pack size and case count to agree
+    when both sides have one, and requires the remaining "core" words to
+    overlap — weighted so generic/boilerplate words shared by many products
+    (JAR, TINS, ASSORTED, CREAM...) count for little, and the word that
+    actually distinguishes two products (a flavor name, say) counts for
+    most of the score. Without that weighting, "Coconut Assorted Cream"
+    would happily match "Orange Assorted Cream" on the two words they share
+    while ignoring the one word that says they're different flavors.
+    """
+    s_size, s_pack, s_core = _product_tokens(stock_name)
+    if not s_core:
+        return None
+
+    cand_tokens = [(c, _product_tokens(c)) for c in candidate_descs]
+    doc_freq = {}
+    for _, (_, _, c_core) in cand_tokens:
+        for w in set(c_core):
+            doc_freq[w] = doc_freq.get(w, 0) + 1
+
+    def weight(w):
+        return 1.0 / (1 + doc_freq.get(w, 0))
+
+    # The word appearing in fewest candidates overall is the most
+    # distinguishing one (usually the flavor/brand name) — require it to
+    # actually match, so it can't be outvoted by a majority of generic
+    # words that merely happen to also match (as in the Chocolate/Orange
+    # Assorted Cream case above, where 3 of 4 words are shared boilerplate).
+    rarest = min(s_core, key=lambda w: doc_freq.get(w, 0))
+
+    best, best_score = None, 0.0
+    for cand, (c_size, c_pack, c_core) in cand_tokens:
+        if s_size and c_size and s_size != c_size:
+            continue
+        if s_pack and c_pack and s_pack != c_pack:
+            continue
+        if not c_core:
+            continue
+        rarest_hit = max((difflib.SequenceMatcher(None, rarest, cw).ratio() for cw in c_core), default=0)
+        if rarest_hit < 0.75:
+            continue
+        total_w = hit_w = 0.0
+        for w in s_core:
+            wt = weight(w)
+            total_w += wt
+            if max((difflib.SequenceMatcher(None, w, cw).ratio() for cw in c_core), default=0) >= 0.75:
+                hit_w += wt
+        coverage = hit_w / total_w if total_w else 0.0
+        if coverage < 0.6:
+            continue
+        whole_ratio = difflib.SequenceMatcher(None, stock_name.strip().upper(), cand.strip().upper()).ratio()
+        score = (coverage + whole_ratio) / 2
+        if score > best_score:
+            best_score, best = score, cand
+    return best if best_score >= cutoff else None
+
+
+def _read_stock_list(file_obj):
+    """
+    Reads a URA 'Stock List' export (.xls or .xlsx). Like the purchases
+    report, it has a title row above the real header.
+    """
+    raw = pd.read_excel(file_obj, header=None, nrows=20)
+    header_row = None
+    for i in range(len(raw)):
+        row_vals = [str(v).strip().upper() for v in raw.iloc[i].tolist()]
+        if "STOCK" in row_vals and any("GOODS/SERVICES NAME" in v for v in row_vals):
+            header_row = i
+            break
+    if header_row is None:
+        raise ValueError(
+            "Could not find a header row containing 'Goods/Services Name' and "
+            "'Stock' in the first 20 rows."
+        )
+    file_obj.seek(0)
+    return pd.read_excel(file_obj, header=header_row)
+
+
+def _latest_unit_prices(enriched_df):
+    """
+    Builds {normalized product name: {price, date, desc}} from an enriched
+    purchases report, keeping only the row with the most recent Invoice Date
+    per product — i.e. the price from the latest purchase invoice for that
+    good. Rows with no Unit Price (unmatched/unscraped) are ignored.
+    """
+    df = enriched_df.copy()
+    df = df[df["Unit Price"].notna() & (df["Unit Price"].astype(str).str.strip() != "")]
+    df["_date"] = pd.to_datetime(df["Invoice Date"], dayfirst=True, errors="coerce")
+    df = df.dropna(subset=["_date"]).sort_values("_date")
+
+    latest = {}
+    for _, row in df.iterrows():
+        try:
+            price = float(str(row["Unit Price"]).replace(",", "").strip())
+        except ValueError:
+            continue
+        norm = _norm_name(row["Description of Goods"])
+        # ascending date order means later rows overwrite earlier ones,
+        # so what remains is always the most recent priced purchase
+        latest[norm] = {
+            "price": price,
+            "date": row["_date"],
+            "desc": str(row["Description of Goods"]).strip(),
+        }
+    return latest
+
+
+def value_stock(enriched_df, stock_df):
+    """
+    Values a stock list using the unit price from each item's latest
+    purchase invoice (as enriched by the EFRIS Invoice Enricher).
+    Returns (valued_df, log_lines, total_value).
+    """
+    log = []
+    def L(msg): log.append(msg)
+
+    L("📋 Step 1 — Building latest-price lookup from enriched purchases...")
+    latest = _latest_unit_prices(enriched_df)
+    L(f"  ✅ {len(latest)} distinct product(s) with a priced purchase")
+
+    candidate_descs = [v["desc"] for v in latest.values()]
+
+    L("🔍 Step 2 — Matching stock items to latest purchase prices...")
+    out = stock_df.copy()
+    for col in ["Matched Purchase Item", "Unit Price", "Latest Invoice Date", "Stock Value"]:
+        out[col] = None
+
+    matched_count = 0
+    for idx, row in out.iterrows():
+        name = str(row.get("Goods/Services Name", "")).strip(" .")
+        if not name:
+            continue
+        hit_desc = _match_stock_item(name, candidate_descs) if candidate_descs else None
+        if not hit_desc:
+            L(f"  ✗ [NO MATCH]  '{name}'")
+            continue
+        info = latest.get(_norm_name(hit_desc))
+        if not info:
+            L(f"  ✗ [LOOKUP FAILED]  '{name}' → '{hit_desc}'")
+            continue
+        try:
+            stock_qty = float(str(row.get("Stock", 0)).strip())
+        except ValueError:
+            stock_qty = 0.0
+        value = round(stock_qty * info["price"], 2)
+        out.at[idx, "Matched Purchase Item"]  = info["desc"]
+        out.at[idx, "Unit Price"]             = info["price"]
+        out.at[idx, "Latest Invoice Date"]    = info["date"].strftime("%d/%m/%Y")
+        out.at[idx, "Stock Value"]            = value
+        matched_count += 1
+        tag = "EXACT" if _norm_name(name) == _norm_name(hit_desc) else "FUZZY"
+        L(f"  ✓ [{tag:5}]  '{name}'  →  '{info['desc']}'  @ {info['price']:,}  x  {stock_qty:,}  =  {value:,.2f}")
+
+    L(f"  ✅ {matched_count}/{len(out)} stock item(s) valued")
+    total_value = out["Stock Value"].dropna().astype(float).sum()
+    L(f"🏁 Total stock value: {total_value:,.2f}")
+    return out, log, total_value
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -545,25 +799,26 @@ def _detect_sm_structure(df):
             "Expected a product name in column C within the first 10 rows."
         )
     abr_row = product_name_row + 1
-    material_start_row = None
+
+    # The "OUTPUT" row (the finished-product line, whose QTY cell is where
+    # expected production belongs) explicitly marks where the raw-material
+    # list starts right below it. Found by exact label match rather than by
+    # skipping until the first non-header word, so its row number is known
+    # precisely (needed later to resolve domestic-usage formulas that
+    # reference it, e.g. "=EN8/50").
+    output_row = None
     for r in range(abr_row + 1, min(abr_row + 20, df.shape[0])):
         v = str(df.iloc[r, 0]).strip()
-        if v in ('nan', 'NaN', ''):
-            continue
-        try:
-            float(v); continue
-        except ValueError:
-            pass
-        if v.lower() in _SM_HEADER_WORDS:
-            continue
-        material_start_row = r
-        break
-    if material_start_row is None:
+        if v.upper() == 'OUTPUT':
+            output_row = r
+            break
+    if output_row is None:
         raise ValueError(
-            "Standard mix: cannot detect material start row. "
-            "Expected an ingredient name in column A within 20 rows of the abbreviation row."
+            "Standard mix: cannot find the 'OUTPUT' row (the finished-product "
+            "line that marks where the raw material list begins)."
         )
-    return product_name_row, abr_row, material_start_row
+    material_start_row = output_row + 1
+    return product_name_row, abr_row, output_row, material_start_row
 
 
 def _parse_standard_mix(sm_bytes):
@@ -579,30 +834,40 @@ def _parse_standard_mix(sm_bytes):
 
     Returns:
       products  : {norm_product_name: {'name': str, 'ratios': {mat_name: float}}}
-      materials : [(mat_name, unit)]
+      materials : [(row, mat_name, unit)] — row is the 1-indexed Excel row
+                  (matching domestic_formulas' keys, and the row numbers
+                  used inside EN<row>/EO<row> formula references), NOT the
+                  0-indexed pandas row used internally while scanning.
+      domestic_formulas : {excel_row_1indexed: canonicalised_formula_or_literal}
     """
     df = pd.read_excel(BytesIO(sm_bytes), header=None)
-    product_name_row, abr_row, material_start_row = _detect_sm_structure(df)
+    product_name_row, abr_row, output_row, material_start_row = _detect_sm_structure(df)
 
-    # Raw materials — col 0 = name, col 1 = unit, from material_start_row downward
+    # Raw materials — col 0 = name, col 1 = unit, scanned all the way to the
+    # end of the sheet rather than stopping at the first blank row. Real
+    # files have formula-active-but-unnamed "reserved" rows in the middle of
+    # this list (still legitimate, just unused slots), and some also list
+    # more named rows further down — other finished products used as an
+    # ingredient, packaging materials, labour — so a blank name can't be
+    # trusted as "the list is over"; only a genuinely named row counts.
     materials = []
     for r in range(material_start_row, df.shape[0]):
         mat_name = str(df.iloc[r, 0]).strip()
-        mat_unit = str(df.iloc[r, 1]).strip()
         if mat_name in ('nan', 'NaN', ''):
-            break
+            continue
         try:
-            float(mat_name); break
+            float(mat_name); continue
         except ValueError:
             pass
         if mat_name.lower() in _SM_HEADER_WORDS:
             continue
+        mat_unit = str(df.iloc[r, 1]).strip()
         unit_clean = mat_unit if mat_unit not in ('nan', 'NaN', '') else ''
-        materials.append((mat_name, unit_clean))
+        materials.append((r + 1, mat_name, unit_clean))  # +1: pandas row -> Excel row
 
     if not materials:
         raise ValueError(
-            "Standard mix: no raw materials found. "
+            "Standard mix: no raw materials found below the OUTPUT row. "
             "Check that ingredient names start in column A."
         )
 
@@ -622,12 +887,8 @@ def _parse_standard_mix(sm_bytes):
             continue
 
         ratios = {}
-        for i, (mat_name, _) in enumerate(materials):
-            row_idx = material_start_row + i
-            if row_idx >= df.shape[0]:
-                ratios[mat_name] = 0.0
-                continue
-            val = df.iloc[row_idx, c]
+        for row_idx, mat_name, _ in materials:
+            val = df.iloc[row_idx - 1, c]  # row_idx is the 1-indexed Excel row; df.iloc is 0-indexed
             try:
                 ratios[mat_name] = (
                     float(val) if str(val).strip() not in ('nan', 'NaN', '') else 0.0
@@ -644,7 +905,110 @@ def _parse_standard_mix(sm_bytes):
             "Standard mix: no valid products found. "
             "Check that product names appear in the first detected row."
         )
-    return products, materials
+
+    domestic_formulas = _parse_domestic_usage_formulas(sm_bytes, output_row, df.shape[0])
+
+    return products, materials, domestic_formulas
+
+
+def _parse_domestic_usage_formulas(sm_bytes, output_row, sheet_row_count):
+    """
+    Locates the 'SUMMARY QTY CONSUMED IN PRODUCTION' and 'DOMESTIC USAGE'
+    columns by header text (their position shifts depending on how many
+    product blocks a given bakery's sheet has, so they can't be hardcoded),
+    and returns each row's DOMESTIC USAGE formula from the OUTPUT row
+    downward — with references to those two columns rewritten to canonical
+    EN<row>/EO<row> tokens so the evaluator never needs to know the real
+    column letters.
+
+    Returns {excel_row_1indexed: formula_text} — formula_text has no
+    leading '='. Rows with a plain hardcoded number get that number as a
+    string; rows with nothing in the DOMESTIC USAGE column are omitted
+    (treated as 0 by the evaluator). Returns {} if this standard mix has no
+    domestic-usage section at all.
+    """
+    from openpyxl.utils import get_column_letter
+
+    wb = openpyxl.load_workbook(BytesIO(sm_bytes), data_only=False)
+    ws = wb.active
+
+    summary_col = domestic_col = None
+    for r in range(1, min(10, ws.max_row) + 1):
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(r, c).value
+            if not isinstance(v, str):
+                continue
+            vu = v.strip().upper()
+            if vu == 'SUMMARY QTY CONSUMED IN PRODUCTION':
+                summary_col = c
+            elif vu == 'DOMESTIC USAGE':
+                domestic_col = c
+        if summary_col and domestic_col:
+            break
+
+    if domestic_col is None:
+        return {}  # this bakery's standard mix has no domestic-usage section
+
+    domestic_letter = get_column_letter(domestic_col)
+    ref_letters = [domestic_letter] + ([get_column_letter(summary_col)] if summary_col else [])
+    ref_re = re.compile(r'\$?(' + '|'.join(re.escape(l) for l in ref_letters) + r')\$?(\d+)\b')
+
+    def canon(m):
+        col, row = m.group(1), m.group(2)
+        return (f'EO{row}' if col == domestic_letter else f'EN{row}')
+
+    formulas = {}
+    start_row = output_row + 1  # openpyxl is 1-indexed; output_row (pandas 0-indexed) + 1 == its own Excel row
+    end_row = min(sheet_row_count, ws.max_row)
+    for r in range(start_row, end_row + 1):
+        v = ws.cell(r, domestic_col).value
+        if isinstance(v, str) and v.startswith('='):
+            formulas[r] = ref_re.sub(canon, v[1:])
+        elif isinstance(v, (int, float)):
+            formulas[r] = str(v)
+    return formulas
+
+
+def _eval_domestic_formula(row, domestic_formulas, production_by_row, memo, visiting=None):
+    """
+    Evaluates a canonicalised DOMESTIC USAGE formula for one standard-mix
+    row, resolving:
+      EN<row> -> that row's already-computed production consumption
+                 for the day currently being processed
+      EO<row> -> that row's own domestic-usage formula, evaluated recursively
+    Only basic arithmetic (+ - * / and parentheses) plus these two reference
+    kinds are supported — a formula using anything else (a spreadsheet
+    function, say) evaluates to 0.0 rather than guessing at it.
+    """
+    if row in memo:
+        return memo[row]
+    formula = domestic_formulas.get(row)
+    if formula is None:
+        return 0.0
+    if visiting is None:
+        visiting = set()
+    if row in visiting:
+        return 0.0  # circular reference guard
+    visiting.add(row)
+
+    def replace_ref(m):
+        col, ref_row = m.group(1), int(m.group(2))
+        if col == 'EN':
+            return repr(production_by_row.get(ref_row, 0.0))
+        return repr(_eval_domestic_formula(ref_row, domestic_formulas, production_by_row, memo, visiting))
+
+    substituted = re.sub(r'(EN|EO)(\d+)', replace_ref, formula)
+    visiting.discard(row)
+
+    if not re.fullmatch(r'[0-9.\+\-\*/() \t]*', substituted):
+        memo[row] = 0.0
+        return 0.0
+    try:
+        result = float(eval(substituted, {"__builtins__": {}}, {}))
+    except Exception:
+        result = 0.0
+    memo[row] = result
+    return result
 
 
 def _parse_finished_movement(fm_bytes):
@@ -652,6 +1016,17 @@ def _parse_finished_movement(fm_bytes):
     Reads col B (product name) and col F (EXPECTED) for every row.
     expected_map  keyed by (date, NORM_PRODUCT_NAME)
     fm_products   set of original product name strings (for display in errors)
+
+    Daily blocks carry a real date in col A only on their first row, with
+    every following row of that block left blank (col A keeps meaning
+    "same date as above" until a new date appears) — so a blank date can't
+    just be skipped, it has to inherit the last real date seen. But a
+    trailing monthly-TOTAL block breaks that assumption: it starts with a
+    text label ("TOTAL") in col A, not a date, and everything below it is
+    also blank — so naively continuing to inherit "the last real date"
+    silently folds the entire month's totals into that last day. Once col A
+    holds something that isn't a date and isn't blank, everything from
+    there on is treated as outside the daily data (parsing stops).
     """
     wb = openpyxl.load_workbook(BytesIO(fm_bytes), data_only=True)
     ws = wb.active
@@ -666,6 +1041,9 @@ def _parse_finished_movement(fm_bytes):
 
         if isinstance(date_v, datetime):
             current_date = date_v.date()
+        elif current_date is not None and date_v is not None and str(date_v).strip():
+            break  # a non-blank, non-date label (e.g. "TOTAL") ends the daily data —
+            # only once we're past the header, i.e. a real date has already been seen
 
         if not name_v or not str(name_v).strip():
             continue
@@ -692,17 +1070,67 @@ def _parse_finished_movement(fm_bytes):
 
 def _match_product_name(fm_name, sm_norm_names):
     """
-    Match a single finished-movement product name to a standard-mix product name.
-    Returns (matched_norm_name_or_None, tag_string).
-    Uses: exact → fuzzy (best match, cutoff 0.60).
-    No substring check — fuzzy naturally picks the highest-ratio match.
+    Match a single finished-movement product name to a standard-mix product
+    name. Returns (matched_norm_name_or_None, tag_string).
+
+    A plain whole-string fuzzy ratio is unsafe here: "TOSS BREAD HALF" and
+    "TOSS BREAD BIG" share 10 of ~14 characters ("TOSS BREAD"), so a
+    character-level ratio rates them as very similar even though "Half"
+    vs "Big" makes them different products with different recipes. Instead,
+    every word that's rare across the candidate list (appears in at most
+    one of them — usually a size/variant qualifier, not generic words like
+    "BREAD" or "CAKES") must actually match before a candidate is even
+    considered — gating on just the single rarest word isn't enough when
+    two words are tied for rarest (as TOSS and HALF are here), since the
+    common word can then drag a weighted-coverage score just over the line.
+    If nothing clears the bar, it's reported as NO MATCH rather than
+    guessed at — the caller already surfaces unmatched products so they can
+    be added to the standard mix, which is safer than silently using the
+    wrong recipe.
     """
     t = _norm_name(fm_name)
     if t in sm_norm_names:
         return t, 'EXACT'
-    hits = difflib.get_close_matches(t, sm_norm_names, n=1, cutoff=0.60)
-    if hits:
-        return hits[0], 'FUZZY'
+
+    def tokens(s):
+        return [w for w in re.findall(r'[A-Z0-9]+', s) if len(w) > 1]
+
+    t_words = tokens(t)
+    if not t_words:
+        return None, 'NO MATCH'
+
+    cand_tokens = [(name, tokens(name)) for name in sm_norm_names]
+    doc_freq = {}
+    for _, c_words in cand_tokens:
+        for w in set(c_words):
+            doc_freq[w] = doc_freq.get(w, 0) + 1
+    critical = [w for w in t_words if doc_freq.get(w, 0) <= 1]
+
+    def word_hit(w, c_words):
+        return max((difflib.SequenceMatcher(None, w, cw).ratio() for cw in c_words), default=0) >= 0.75
+
+    best, best_score = None, 0.0
+    for cand, c_words in cand_tokens:
+        if not c_words:
+            continue
+        if critical and any(not word_hit(w, c_words) for w in critical):
+            continue
+        total_w = hit_w = 0.0
+        for w in t_words:
+            wt = 1.0 / (1 + doc_freq.get(w, 0))
+            total_w += wt
+            if word_hit(w, c_words):
+                hit_w += wt
+        coverage = hit_w / total_w if total_w else 0.0
+        if coverage < 0.7:
+            continue
+        whole_ratio = difflib.SequenceMatcher(None, t, cand).ratio()
+        score = (coverage + whole_ratio) / 2
+        if score > best_score:
+            best_score, best = score, cand
+
+    if best and best_score >= 0.60:
+        return best, 'FUZZY'
     return None, 'NO MATCH'
 
 
@@ -774,7 +1202,7 @@ def _smart_match_materials(tpl_materials, sm_materials):
     standard mix.  Uses exact then fuzzy (cutoff 0.65).
     Returns match_map {tpl_name: sm_name_or_None}, unmatched list.
     """
-    sm_names  = [m[0] for m in sm_materials]
+    sm_names  = [m[1] for m in sm_materials]
     sm_upper  = [m.upper().strip() for m in sm_names]
     match_map = {}
     unmatched = []
@@ -801,38 +1229,63 @@ def _smart_match_materials(tpl_materials, sm_materials):
 
 
 def _calculate_and_fill(wb, ws, tpl_materials, date_to_block_start,
-                         match_map, products, expected_map, fm_name_to_sm_norm):
+                         match_map, products, expected_map, fm_name_to_sm_norm,
+                         materials, domestic_formulas):
     """
-    For each day × each raw material:
-      col 9 = Σ ( ratio(material, product) × EXPECTED(product, day) )
-              summed over every finished product.
+    For each day:
+      1. Production consumption is computed for EVERY row in the standard
+         mix's material list, not just the ones the template has a slot
+         for — domestic-usage formulas can reference *other* materials'
+         production totals (this bakery's domestic oil/fat/salt usage are
+         all defined as multiples of flour's production total), so all of
+         them need to be available before any domestic figure can be
+         evaluated.
+      2. For each raw material the template actually has a slot for:
+           col 9 = production consumption + domestic usage
+         where domestic usage is evaluated from the standard mix's own
+         DOMESTIC USAGE column formulas (see _eval_domestic_formula) rather
+         than invented — this bakery already defines exactly what its
+         domestic usage should be, the same way it defines material ratios.
 
     products      keyed by norm_product_name
     expected_map  keyed by (date, norm_product_name_from_fm)
     fm_name_to_sm_norm maps norm FM product name → norm SM product name
                         (handles fuzzy name differences between files)
+    materials     [(row, mat_name, unit)] — every named row below OUTPUT
     Only col 9 is written; all other formulas in the template are preserved.
     """
+    name_to_row = {mat_name: row for row, mat_name, _ in materials}
+
     filled = 0
     for date_obj, block_start in sorted(date_to_block_start.items()):
-        for offset, tpl_name, _ in tpl_materials:
-            sm_mat_name = match_map.get(tpl_name)
-            if sm_mat_name is None:
-                continue
-
+        production_by_row = {}
+        for row_idx, mat_name, _ in materials:
             total = 0.0
             for norm_fm, exp in expected_map.items():
                 if norm_fm[0] != date_obj or exp == 0.0:
                     continue
-                # Translate FM product name key → SM product name key
                 sm_norm = fm_name_to_sm_norm.get(norm_fm[1])
                 if sm_norm is None:
                     continue
                 prod = products.get(sm_norm)
                 if prod is None:
                     continue
-                ratio  = prod['ratios'].get(sm_mat_name, 0.0)
+                ratio = prod['ratios'].get(mat_name, 0.0)
                 total += ratio * exp
+            production_by_row[row_idx] = total
+
+        memo = {}
+        for offset, tpl_name, _ in tpl_materials:
+            sm_mat_name = match_map.get(tpl_name)
+            if sm_mat_name is None:
+                continue
+            row_idx = name_to_row.get(sm_mat_name)
+            if row_idx is None:
+                continue
+
+            production = production_by_row.get(row_idx, 0.0)
+            domestic = _eval_domestic_formula(row_idx, domestic_formulas, production_by_row, memo)
+            total = production + domestic
 
             if total > 0:
                 ws.cell(block_start + offset, 9).value = round(total, 4)
@@ -850,8 +1303,13 @@ def process_raw_material_movement(sm_file, fm_file, rm_template_file, output_nam
         # ── Step 1: Standard Mix ─────────────────────────────────────────────
         L("📋 Step 1 — Parsing standard mix...")
         sm_bytes  = sm_file.read()
-        products, sm_materials = _parse_standard_mix(sm_bytes)
-        L(f"  ✅ {len(products)} finished product(s) | {len(sm_materials)} raw material(s)")
+        products, sm_materials, domestic_formulas = _parse_standard_mix(sm_bytes)
+        L(f"  ✅ {len(products)} finished product(s) | {len(sm_materials)} named line(s) in "
+          f"standard mix (ingredients, and possibly packaging/cross-product/labour if used)")
+        if domestic_formulas:
+            L(f"  ✅ Domestic usage section found — {len(domestic_formulas)} row(s) with a formula")
+        else:
+            L("  ℹ️  No domestic usage section found in this standard mix — domestic usage will be 0")
         L("  📦 Products in standard mix:")
         for norm, p in products.items():
             L(f"       • {p['name']}")
@@ -924,10 +1382,11 @@ def process_raw_material_movement(sm_file, fm_file, rm_template_file, output_nam
               f"verify spelling between template and standard mix")
 
         # ── Step 6: Calculate and fill ───────────────────────────────────────
-        L("⚙️  Step 6 — Calculating STOCK ISSUED TO PRODUCTION...")
+        L("⚙️  Step 6 — Calculating STOCK ISSUED TO PRODUCTION (production + domestic usage)...")
         wb_out, filled = _calculate_and_fill(
             wb, ws, tpl_materials, date_to_block_start,
-            match_map, products, expected_map, fm_name_to_sm_norm
+            match_map, products, expected_map, fm_name_to_sm_norm,
+            sm_materials, domestic_formulas
         )
         L(f"  ✅ {filled} cell(s) written to STOCK ISSUED TO PRODUCTION (col I)")
 
@@ -986,23 +1445,24 @@ if tool == "Excel Stock Movement Filler":
 elif tool == "EFRIS Invoice Enricher":
     st.header("EFRIS Invoice Enricher")
     st.markdown("""
-    Upload your **Purchases Report** (.xlsx) with columns **FDN** and **Description of Goods**.
+    Upload your **Purchases Report** (.xlsx or .xls — the URA "VAT Purchases Report"
+    export works directly) with columns **FDN** and **Description of Goods**.
     The tool opens each invoice on EFRIS, reads the PDF, and fills in
     **Quantity**, **Unit Measure**, and **Unit Price** for every row.
     > Duplicate FDNs are only fetched once.
     """)
     col1, col2 = st.columns([2, 1])
     with col1:
-        purchases_file = st.file_uploader("Upload Purchases Report (.xlsx)", type=["xlsx"], key="ef_up")
+        purchases_file = st.file_uploader("Upload Purchases Report (.xlsx or .xls)", type=["xlsx", "xls"], key="ef_up")
     with col2:
         out_name = st.text_input("Output Filename", value="enriched_purchases", key="ef_out")
         out_name = out_name.removesuffix(".xlsx").strip() + ".xlsx"
     if purchases_file:
         try:
-            prev = pd.read_excel(purchases_file, nrows=5)
+            prev = _read_purchases_report(purchases_file)
             purchases_file.seek(0)
             st.markdown("**Preview:**")
-            st.dataframe(prev, use_container_width=True)
+            st.dataframe(prev.head(5), use_container_width=True)
             missing = {"FDN", "Description of Goods"} - set(prev.columns)
             if missing:
                 st.error(f"Missing columns: {missing}")
@@ -1014,15 +1474,84 @@ elif tool == "EFRIS Invoice Enricher":
         prog   = st.progress(0, text="Starting...")
         log_ph = st.empty()
         try:
-            df       = pd.read_excel(purchases_file)
+            df       = _read_purchases_report(purchases_file)
             enriched = run_efris_enrichment(df, log_ph, prog)
             prog.progress(1.0, text="✅ Done!")
-            st.success("Complete!")
-            st.download_button("⬇️ Download Enriched Excel",
-                data=build_output_excel(enriched), file_name=out_name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            filled = enriched["Quantity"].notna().sum()
-            st.info(f"📊 {filled} / {len(enriched)} rows enriched.")
+            st.session_state["efris_enriched_df"] = enriched
+            st.session_state["efris_out_name"]    = out_name
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+    # Kept outside the button block (gated on session_state instead) so the
+    # download button and the stock-valuation prompt below both survive
+    # later reruns — e.g. uploading the Stock List file — instead of
+    # disappearing the moment a different widget is interacted with.
+    if "efris_enriched_df" in st.session_state:
+        enriched = st.session_state["efris_enriched_df"]
+        st.success("Complete!")
+        st.download_button("⬇️ Download Enriched Excel",
+            data=build_output_excel(enriched),
+            file_name=st.session_state.get("efris_out_name", out_name),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="ef_download")
+        filled = enriched["Quantity"].notna().sum()
+        st.info(f"📊 {filled} / {len(enriched)} rows enriched.")
+
+    # Value Stock is intentionally NOT gated on having just run an
+    # enrichment in this session — if you already have a previously
+    # downloaded enriched Purchases Report, you can upload it directly and
+    # skip re-running EFRIS enrichment entirely.
+    st.markdown("---")
+    st.subheader("📦 Value Stock")
+    st.markdown("""
+    Value your closing stock using the **unit price from each item's latest
+    purchase invoice**.
+    """)
+
+    has_session_data = "efris_enriched_df" in st.session_state
+    if has_session_data:
+        source_choice = st.radio(
+            "Enriched purchases data",
+            ["Use the result from the enrichment above", "Upload an enriched Purchases Report instead"],
+            key="sv_source")
+    else:
+        source_choice = "Upload an enriched Purchases Report instead"
+        st.caption("No enrichment run yet this session — upload a previously-downloaded "
+                   "enriched Purchases Report (the file with Quantity/Unit Measure/Unit "
+                   "Price already filled in) to continue.")
+
+    enriched_for_valuation = None
+    if source_choice == "Use the result from the enrichment above":
+        enriched_for_valuation = st.session_state["efris_enriched_df"]
+    else:
+        enriched_upload = st.file_uploader(
+            "Upload enriched Purchases Report (.xlsx or .xls)",
+            type=["xlsx", "xls"], key="sv_enriched_up")
+        if enriched_upload:
+            try:
+                enriched_for_valuation = pd.read_excel(enriched_upload)
+                missing = {"Description of Goods", "Unit Price", "Invoice Date"} - set(enriched_for_valuation.columns)
+                if missing:
+                    st.error(f"Missing columns in enriched file: {missing}")
+                    enriched_for_valuation = None
+            except Exception as e:
+                st.error(str(e))
+
+    stock_file = st.file_uploader("Upload Stock List (.xlsx or .xls)", type=["xlsx", "xls"], key="sv_up")
+    if st.button("💰 Value Stock", disabled=(stock_file is None or enriched_for_valuation is None), key="sv_run"):
+        try:
+            stock_df = _read_stock_list(stock_file)
+            valued_df, val_log, total_value = value_stock(enriched_for_valuation, stock_df)
+            st.markdown('<div class="log-box">' + "<br>".join(val_log) + "</div>", unsafe_allow_html=True)
+            st.success(f"✅ Stock valued — total value: UGX {total_value:,.2f}")
+            st.download_button("⬇️ Download Valued Stock List",
+                data=build_output_excel(
+                    valued_df, sheet_name="Stock Valuation",
+                    highlight_cols=("Matched Purchase Item", "Unit Price",
+                                     "Latest Invoice Date", "Stock Value")),
+                file_name="stock_valuation.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="sv_download")
         except Exception as e:
             st.error(f"Error: {e}")
 
