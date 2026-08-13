@@ -143,6 +143,14 @@ def process_excel(template_file, report_file, damages_file, output_name="filled_
         damages_per_day = {}
         for abr, total_d in damages_dict.items():
             abr_ins = ins_df[ins_df['abbreviations'] == abr]
+            # Only allocate damages onto days that actually have a row in
+            # the template — the movement report can cover a wider date
+            # range than the template (e.g. it included September stock-in
+            # rows for a July-only template here), and any damages randomly
+            # assigned to a day with no template row would silently vanish
+            # when writing, instead of just not being drawn in the first
+            # place.
+            abr_ins = abr_ins[abr_ins['date'].apply(lambda d: (d.date(), abr) in date_abr_to_row)]
             if abr_ins.empty:
                 continue
             days           = abr_ins['date'].dt.date.values
@@ -532,7 +540,18 @@ def _read_purchases_report(file_obj):
             "'Description of Goods' in the first 20 rows."
         )
     file_obj.seek(0)
-    return pd.read_excel(file_obj, header=header_row)
+    df = pd.read_excel(file_obj, header=header_row)
+    if "FDN" in df.columns:
+        # FDNs exceed Excel's/int64's numeric range (the export itself warns
+        # "do not convert the FDNs to number"), but not every source file
+        # keeps the column as text — when it doesn't, pandas reads the huge
+        # ones as genuine Python ints, and Streamlit's table preview crashes
+        # trying to fit them into a fixed-width Arrow int column ("Python
+        # int too large to convert to C long"). Force it to string
+        # immediately so this never depends on how the source file typed
+        # the column — str() on a Python int is exact, no precision lost.
+        df["FDN"] = df["FDN"].apply(lambda v: str(int(v)) if isinstance(v, float) and v.is_integer() else str(v).strip())
+    return df
 
 
 def build_output_excel(df, sheet_name="Purchases Report",
