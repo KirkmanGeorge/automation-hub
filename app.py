@@ -1343,6 +1343,129 @@ def _smart_match_materials(tpl_materials, sm_materials):
     return match_map, unmatched
 
 
+def _clean_numeric(v):
+    """Parses a possibly comma-formatted numeric cell (e.g. "1,250.00");
+    returns None if it isn't a usable number — same cleanup already applied
+    to Unit Price elsewhere (_latest_unit_prices, value_stock)."""
+    try:
+        return float(str(v).replace(",", "").strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_purchases_for_rm(purchases_bytes, sm_material_names, date_start, date_end):
+    """
+    Reads an enriched Purchases Report (Tool 2's output) and extracts
+    per-material, per-day totals to fill STOCK RECEIVED in the Raw
+    Material Movement output — raw material stock actually starts at
+    purchasing, not at production, and without this the sheet's own
+    running Balance formula drifts negative even though the materials
+    were genuinely bought.
+
+    Only rows whose Invoice Date falls within [date_start, date_end] (the
+    Raw Material Template's own date range) are considered — the purchases
+    report can span far more months than the one currently being processed.
+
+    Matches each purchase row's 'Description of Goods' against
+    sm_material_names using the same exact-then-fuzzy matcher used
+    elsewhere in Tool 3 for template <-> standard-mix material matching.
+    A purchased item that doesn't match any material, or a material with
+    no matching purchases, is simply left alone — no fill, no error.
+
+    Multiple purchase lines for the same material on the same day are
+    combined: quantities sum, and price is the quantity-weighted average.
+
+    Returns (received_map, log_lines) where received_map is
+    {(date, sm_material_name): (total_qty, avg_price)}.
+    """
+    log_lines = []
+    df = pd.read_excel(BytesIO(purchases_bytes))
+    missing = {"Description of Goods", "Quantity", "Unit Price", "Invoice Date"} - set(df.columns)
+    if missing:
+        raise ValueError(f"Enriched Purchases Report is missing column(s): {missing}")
+
+    df = df.copy()
+    df["_date"] = pd.to_datetime(df["Invoice Date"], dayfirst=True, errors="coerce").dt.date
+    df = df[df["_date"].notna() & (df["_date"] >= date_start) & (df["_date"] <= date_end)]
+    df["_qty"] = df["Quantity"].apply(_clean_numeric)
+    df["_price"] = df["Unit Price"].apply(_clean_numeric)
+    df = df[df["_qty"].notna() & df["_price"].notna() & (df["_qty"] > 0)]
+
+    if df.empty:
+        log_lines.append("  ℹ️  No purchase rows fall within this template's date range "
+                          "(or none have a valid quantity/price) — nothing to fill.")
+        return {}, log_lines
+
+    distinct_items = df["Description of Goods"].astype(str).str.strip().unique().tolist()
+    purchase_tuples = [(i, name, '') for i, name in enumerate(distinct_items)]
+    sm_tuples = [(i, name, '') for i, name in enumerate(sm_material_names)]
+    match_map, unmatched = _smart_match_materials(purchase_tuples, sm_tuples)
+
+    df["_material"] = df["Description of Goods"].astype(str).str.strip().map(match_map)
+    matched_df = df[df["_material"].notna()]
+
+    received_map = {}
+    for (date, material), group in matched_df.groupby(["_date", "_material"]):
+        total_qty = group["_qty"].sum()
+        if total_qty <= 0:
+            continue
+        avg_price = (group["_qty"] * group["_price"]).sum() / total_qty
+        received_map[(date, material)] = (total_qty, avg_price)
+
+    for item in distinct_items:
+        sm_name = match_map.get(item)
+        tag = "EXACT" if sm_name and item.upper().strip() == sm_name.upper().strip() else ("FUZZY" if sm_name else "NO MATCH")
+        if sm_name:
+            log_lines.append(f"       ✓ [{tag:8}]  '{item}'  →  '{sm_name}'")
+        else:
+            log_lines.append(f"       ✗ [NO MATCH]  '{item}'  →  skipped (not in standard mix)")
+
+    if unmatched:
+        log_lines.append(f"  ⚠️  {len(unmatched)} purchased item(s) skipped — no matching raw material")
+    log_lines.append(f"  ✅ {len(received_map)} date-material entr{'y' if len(received_map) == 1 else 'ies'} "
+                      f"ready to fill from purchases")
+
+    return received_map, log_lines
+
+
+def _fill_stock_received(ws, tpl_materials, date_to_block_start, match_map, received_map):
+    """
+    Writes STOCK RECEIVED Qty + Unit Price into the raw material template
+    from received_map (see _parse_purchases_for_rm), reusing the same
+    tpl_materials/date_to_block_start/match_map structures Step 6 already
+    built so the rows line up exactly. The Qty column is located by header
+    text the same way Tool 1's name-match mode locates its columns; Price
+    is always the next column over, matching the Qty/Price/Amount block
+    convention used throughout these templates. Only cells with matching
+    purchase data are touched — any existing value (formula or figure) in
+    those two cells is overwritten with the real purchased quantity/price;
+    everything else (Amount, Balance, materials with no purchases) is left
+    exactly as it was.
+    """
+    recv_col = _find_header_col(ws, "STOCK RECEIVED")
+    if recv_col is None:
+        return None
+    price_col = recv_col + 1
+
+    sm_to_offset = {}
+    for offset, tpl_name, _ in tpl_materials:
+        sm_name = match_map.get(tpl_name)
+        if sm_name:
+            sm_to_offset[sm_name] = offset
+
+    filled = 0
+    for (date, sm_name), (qty, price) in received_map.items():
+        offset = sm_to_offset.get(sm_name)
+        block_start = date_to_block_start.get(date)
+        if offset is None or block_start is None:
+            continue
+        row = block_start + offset
+        ws.cell(row, recv_col).value = round(qty, 4)
+        ws.cell(row, price_col).value = round(price, 4)
+        filled += 1
+    return filled
+
+
 def _calculate_and_fill(wb, ws, tpl_materials, date_to_block_start,
                          match_map, products, expected_map, fm_name_to_sm_norm,
                          materials, domestic_formulas):
@@ -1410,7 +1533,7 @@ def _calculate_and_fill(wb, ws, tpl_materials, date_to_block_start,
 
 
 def _run_raw_material_calc(products, sm_materials, domestic_formulas, fm_file, rm_template_file, output_name, log, L,
-                            fm_mode="expected"):
+                            fm_mode="expected", purchases_file=None):
     """
     Shared by both the Excel-parsed standard mix path and the in-app
     configured standard mix path — Steps 2-6 are identical either way, so
@@ -1422,6 +1545,12 @@ def _run_raw_material_calc(products, sm_materials, domestic_formulas, fm_file, r
     bakery-style Tool 1 output; "stock_in" reads STOCK RECEIVED instead,
     for a Kombucha-style Tool 1 output where raw material consumption is
     driven by units received into stock that day, not an EXPECTED figure.
+
+    purchases_file is optional — when provided (Tool 2's enriched Purchases
+    Report), Step 7 fills STOCK RECEIVED Qty/Price from real purchases so
+    the sheet's running Balance reflects actual stock instead of drifting
+    negative. Omitted entirely, behavior is unchanged from before this
+    existed.
     """
     try:
         # ── Step 2: Finished Movement ────────────────────────────────────────
@@ -1504,6 +1633,24 @@ def _run_raw_material_calc(products, sm_materials, domestic_formulas, fm_file, r
         )
         L(f"  ✅ {filled} cell(s) written to STOCK ISSUED TO PRODUCTION (col I)")
 
+        # ── Step 7 (optional): Fill STOCK RECEIVED from purchases ─────────────
+        if purchases_file is not None:
+            L("🧾 Step 7 — Filling STOCK RECEIVED from the enriched Purchases Report...")
+            purchases_bytes = purchases_file.read()
+            date_start = min(date_to_block_start)
+            date_end = max(date_to_block_start)
+            sm_material_names = [name for _, name, _ in sm_materials]
+            received_map, purchase_log = _parse_purchases_for_rm(
+                purchases_bytes, sm_material_names, date_start, date_end
+            )
+            for line in purchase_log:
+                L(line)
+            recv_filled = _fill_stock_received(ws, tpl_materials, date_to_block_start, match_map, received_map)
+            if recv_filled is None:
+                L("  ⚠️  Could not find a 'STOCK RECEIVED' column in this template — skipped.")
+            else:
+                L(f"  ✅ {recv_filled} cell(s) filled in STOCK RECEIVED (Qty + Unit Price)")
+
         out = BytesIO()
         wb_out.save(out)
         out.seek(0)
@@ -1517,7 +1664,8 @@ def _run_raw_material_calc(products, sm_materials, domestic_formulas, fm_file, r
         return None, log
 
 
-def process_raw_material_movement(sm_file, fm_file, rm_template_file, output_name, fm_mode="expected"):
+def process_raw_material_movement(sm_file, fm_file, rm_template_file, output_name, fm_mode="expected",
+                                   purchases_file=None):
     """Master function called from Streamlit UI — Standard Mix Excel path."""
     log = []
     def L(msg): log.append(msg)
@@ -1543,7 +1691,8 @@ def process_raw_material_movement(sm_file, fm_file, rm_template_file, output_nam
         return None, log
 
     return _run_raw_material_calc(products, sm_materials, domestic_formulas,
-                                   fm_file, rm_template_file, output_name, log, L, fm_mode=fm_mode)
+                                   fm_file, rm_template_file, output_name, log, L, fm_mode=fm_mode,
+                                   purchases_file=purchases_file)
 
 
 def _config_to_sm_data(config):
@@ -1586,7 +1735,8 @@ def _config_to_sm_data(config):
     return products, sm_materials, domestic_formulas
 
 
-def process_raw_material_movement_from_config(config, fm_file, rm_template_file, output_name, fm_mode="expected"):
+def process_raw_material_movement_from_config(config, fm_file, rm_template_file, output_name, fm_mode="expected",
+                                               purchases_file=None):
     """Master function called from Streamlit UI — in-app configured standard mix path."""
     log = []
     def L(msg): log.append(msg)
@@ -1603,7 +1753,8 @@ def process_raw_material_movement_from_config(config, fm_file, rm_template_file,
         L(f"       • {p['name']}")
 
     return _run_raw_material_calc(products, sm_materials, domestic_formulas,
-                                   fm_file, rm_template_file, output_name, log, L, fm_mode=fm_mode)
+                                   fm_file, rm_template_file, output_name, log, L, fm_mode=fm_mode,
+                                   purchases_file=purchases_file)
 
 
 def _empty_rm_config():
@@ -1987,6 +2138,23 @@ elif tool == "Raw Material Movement Filler":
             help="Your blank raw material movement template (company-specific)."
         )
 
+    with st.expander("④ Optional: fill STOCK RECEIVED from a Purchases Report"):
+        st.caption(
+            "Raw material stock actually starts at purchasing, not at production — without this, "
+            "STOCK ISSUED TO PRODUCTION gets filled but STOCK RECEIVED stays empty and the sheet's "
+            "running Balance drifts negative. Upload Tool 2's enriched Purchases Report (with the "
+            "raw material item names already edited to match this standard mix, and quantities "
+            "already converted to the units this template uses) and it'll fill STOCK RECEIVED Qty "
+            "and Unit Price for each raw material on the exact day it was purchased, within this "
+            "template's own date range. Purchased items that don't match a material, or materials "
+            "with no matching purchases, are left alone. Leave this empty to skip it entirely."
+        )
+        purchases_file = st.file_uploader(
+            "Enriched Purchases Report (.xlsx)",
+            type="xlsx", key="rm_purchases",
+            help="Output of Tool 2's EFRIS Invoice Enricher."
+        )
+
     out_name_rm = st.text_input("Output Filename", value="raw_material_filled", key="rm_out")
     out_name_rm = out_name_rm.removesuffix(".xlsx").strip() + ".xlsx"
 
@@ -2042,11 +2210,12 @@ elif tool == "Raw Material Movement Filler":
         with st.spinner("Processing..."):
             if sm_mode == "Upload Excel file":
                 out_bytes, log_lines = process_raw_material_movement(
-                    sm_file, fm_file, rm_file, out_name_rm, fm_mode=fm_mode
+                    sm_file, fm_file, rm_file, out_name_rm, fm_mode=fm_mode, purchases_file=purchases_file
                 )
             else:
                 out_bytes, log_lines = process_raw_material_movement_from_config(
-                    st.session_state["rm_config"], fm_file, rm_file, out_name_rm, fm_mode=fm_mode
+                    st.session_state["rm_config"], fm_file, rm_file, out_name_rm, fm_mode=fm_mode,
+                    purchases_file=purchases_file
                 )
         # Show log
         log_ph.markdown(
