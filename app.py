@@ -346,17 +346,18 @@ def _allocate_by_volume(total, volumes, jitter=0.15):
 
 
 def _volume_scaled_diffs(actuals, max_pct=0.03, max_gap=15, shortage_prob=0.7,
-                         zero_prob_small=0.65, zero_prob_big=0.10):
+                         zero_prob_small=0.30, zero_prob_big=0.05):
     """
     Expected-minus-actual differences for one product's days, scaled to
-    each day's volume: a random size up to about `max_pct` (3%) of the
-    actual figure, never more than `max_gap` (15) units however big the
-    day. A 20-unit day is usually off by 0-1; an 800-unit day by up to 15.
+    each day's volume: a random size of about 1-`max_pct` (3%) of the
+    actual figure, at least 1 unit on a day that has a difference, and
+    never more than `max_gap` (15) units however big the day. A 20-unit
+    day is off by 1; an 800-unit day by up to 15.
 
-    Not every day has a difference. Each day first gets a chance of
-    matching exactly (expected = actual) that depends on its volume
-    relative to the product's busiest day: about `zero_prob_small` (65%)
-    for the quietest days, falling to `zero_prob_big` (10%) for the busiest.
+    Most days have a difference, but not all. Each day first gets a chance
+    of matching exactly (expected = actual) that depends on its volume
+    relative to the product's busiest day: about `zero_prob_small` (30%)
+    for the quietest days, falling to `zero_prob_big` (5%) for the busiest.
 
     Among the days that do have a gap, the sizes are drawn at random and
     re-sorted onto those days by volume, so a smaller day never has a
@@ -373,8 +374,8 @@ def _volume_scaled_diffs(actuals, max_pct=0.03, max_gap=15, shortage_prob=0.7,
     has_gap = np.random.random(n) >= p_zero
     idx = np.where(has_gap)[0]
     if len(idx):
-        sizes = np.round(actuals[idx] * np.random.uniform(0, max_pct, size=len(idx))).astype(int)
-        sizes = np.minimum(sizes, max_gap)
+        sizes = np.round(actuals[idx] * np.random.uniform(0.01, max_pct, size=len(idx))).astype(int)
+        sizes = np.clip(sizes, 1, max_gap)
         by_volume = idx[np.argsort(-actuals[idx], kind="stable")]
         out[by_volume] = np.sort(sizes)[::-1]
     signs = np.where(np.random.random(n) < shortage_prob, 1, -1)
